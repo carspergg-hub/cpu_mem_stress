@@ -48,3 +48,29 @@ mem_min,必填,0 - 99,内存占用率下限 (%)
 mem_max,必填,0 - 99,内存占用率上限 (%)
 mem_step,必填,> 0,内存波浪周期 (秒) - 多久变动一次目标水位
 duration,可选,> 0,压测总时长 (秒)。默认值: 60
+
+🛑 手动干预与干掉压测
+脚本设计为响应优先。当你想立刻停止所有压力时，直接按下 Ctrl+C 即可。
+
+如果由于终端断开等意外情况需要手动强制清理：
+# 终止进程组
+pkill -TERM -f stress.sh
+
+
+💡 工作原理架构图 (简述)
+[Main Process] (CPU0 Exempt)
+  │
+  ├──> [CPU Wave Controller] ---> writes to ---> /dev/shm/cpu_p_$$ (1<> mode)
+  ├──> [MEM Wave Controller] ---> writes to ---> /dev/shm/mem_p_$$ (1<> mode)
+  │
+  ├──> [Python Memory Worker] <--- reads from -- /dev/shm/mem_p_$$ (0.3s poll)
+  │      └─> allocate/pop bytearrays + gc.collect()
+  │
+  ├──> [Bash CPU Worker (Core 1)] <--- reads from -- /dev/shm/cpu_p_$$
+  │      ├─> calibrate() every 10s
+  │      └─> tight matrix loop + sleep offset
+  │
+  └──> [Bash CPU Worker (Core N)] ...
+
+📜 License
+MIT License. 自由使用，欢迎提交 PR 共同优化！
