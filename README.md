@@ -37,3 +37,14 @@
 ```bash
 wget [https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh](https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh)
 chmod +x stress.sh
+### 2. 命令格式
+./stress.sh <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
+### 3. 参数说明
+参数,类型,范围,说明
+cpu_min,必填,0 - 99,CPU 占用率下限 (%)
+cpu_max,必填,0 - 99,CPU 占用率上限 (%)
+cpu_step,必填,> 0,CPU 波浪周期 (秒) - 多久变动一次目标频率
+mem_min,必填,0 - 99,内存占用率下限 (%)
+mem_max,必填,0 - 99,内存占用率上限 (%)
+mem_step,必填,> 0,内存波浪周期 (秒) - 多久变动一次目标水位
+duration,可选,> 0,压测总时长 (秒)。默认值: 60
