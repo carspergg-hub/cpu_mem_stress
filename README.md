@@ -1,9 +1,5 @@
 #  Extreme Wave Stressor: 极速 CPU & Memory 压力波动发生器
 
-![Bash](https://img.shields.io/badge/Language-Bash%20%7C%20Python3-blue)
-![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
-![License](https://img.shields.io/badge/License-MIT-green)
-
 **Extreme Wave Stressor** 是一个专为严苛企业级环境和云原生容器（Cgroup）设计的极速、无依赖的系统压力测试脚本。它不仅能让 CPU 和内存按照你设定的频率产生**完全异步的波浪式压力**，还从内核调度和底层 I/O 层面解决了一般压测脚本在极端压力下容易出现的“时间漂移”、“精度丢失”和“系统死锁”问题。
 
 ## ✨ 核心特性 (Hardcore Features)
