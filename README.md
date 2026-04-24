@@ -35,7 +35,7 @@
 
 ### 1. 下载脚本并赋予权限
 ```bash
-wget [https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh](https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh)
+wget https://raw.githubusercontent.com/carspergg-hub/cpu_mem_stress/refs/heads/main/stress.sh
 chmod +x stress.sh
 ### 2. 命令格式
 ./stress.sh <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
