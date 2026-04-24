@@ -1,4 +1,4 @@
-# 🌊 Extreme Wave Stressor: 极速 CPU & Memory 压力波动发生器
+#  Extreme Wave Stressor: 极速 CPU & Memory 压力波动发生器
 
 ![Bash](https://img.shields.io/badge/Language-Bash%20%7C%20Python3-blue)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
