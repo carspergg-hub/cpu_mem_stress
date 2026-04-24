@@ -1,5 +1,8 @@
-# cpu_mem_stress
 # 🌊 Extreme Wave Stressor: 极速 CPU & Memory 压力波动发生器
+
+![Bash](https://img.shields.io/badge/Language-Bash%20%7C%20Python3-blue)
+![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 **Extreme Wave Stressor** 是一个专为严苛企业级环境和云原生容器（Cgroup）设计的极速、无依赖的系统压力测试脚本。它不仅能让 CPU 和内存按照你设定的频率产生**完全异步的波浪式压力**，还从内核调度和底层 I/O 层面解决了一般压测脚本在极端压力下容易出现的“时间漂移”、“精度丢失”和“系统死锁”问题。
 
@@ -28,29 +31,9 @@
 
 ---
 
-1. 命令格式Bash./stress.sh <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
-2. 参数说明参数类型范围说明cpu_min必填0 - 99CPU 占用率下限 (%)cpu_max必填0 - 99CPU 占用率上限 (%)cpu_step必填> 0CPU 波浪周期 (秒) - 多久变动一次目标频率mem_min必填0 - 99内存占用率下限 (%)mem_max必填0 - 99内存占用率上限 (%)mem_step必填> 0内存波浪周期 (秒) - 多久变动一次目标水位duration可选> 0压测总时长 (秒)。默认值: 60(注：为保证系统可调度性，脚本内部硬编码了最大占用率安全阈值为 99%)🎯 典型场景示例场景 A：云原生容器弹性伸缩 (HPA) 测试模拟 CPU 突发脉冲，同时内存缓慢增长。Bash# CPU：在 10% 到 90% 之间剧烈震荡（每 2 秒变化一次）
-# 内存：在 60% 到 80% 之间平缓波动（每 30 秒变化一次）
-# 时长：持续运行 5 分钟 (300 秒)
-./stress.sh 10 90 2 60 80 30 300
-场景 B：数据库节点高负载压测模拟高内存占用和中等偏高的 CPU 稳定波动。Bash# CPU：在 60% 到 75% 之间小幅波动（每 5 秒变化一次）
-# 内存：高水位 85% 到 95% 之间波动（每 10 秒变化一次）
-# 时长：持续运行 10 分钟 (600 秒)
-./stress.sh 60 75 5 85 95 10 600
-场景 C：获取帮助信息Bash./stress.sh -h
-🛑 手动干预与干掉压测脚本设计为响应优先。当你想立刻停止所有压力时，直接按下 Ctrl+C 即可。如果由于终端断开等意外情况需要手动强制清理：Bash# 终止进程组
-pkill -TERM -f stress.sh
-💡 工作原理架构图 (简述)Plaintext[Main Process] (CPU0 Exempt)
-  │
-  ├──> [CPU Wave Controller] ---> writes to ---> /dev/shm/cpu_p_$$ (1<> mode)
-  ├──> [MEM Wave Controller] ---> writes to ---> /dev/shm/mem_p_$$ (1<> mode)
-  │
-  ├──> [Python Memory Worker] <--- reads from -- /dev/shm/mem_p_$$ (0.3s poll)
-  │      └─> allocate/pop bytearrays + gc.collect()
-  │
-  ├──> [Bash CPU Worker (Core 1)] <--- reads from -- /dev/shm/cpu_p_$$
-  │      ├─> calibrate() every 10s
-  │      └─> tight matrix loop + sleep offset
-  │
-  └──> [Bash CPU Worker (Core N)] ...
-📜 LicenseMIT License. 自由使用，欢迎提交 PR 共同优化！
+## 🚀 快速开始
+
+### 1. 下载脚本并赋予权限
+```bash
+wget [https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh](https://raw.githubusercontent.com/your-username/your-repo/main/stress.sh)
+chmod +x stress.sh
