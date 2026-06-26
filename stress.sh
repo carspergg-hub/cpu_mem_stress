@@ -108,22 +108,32 @@ def parse(line):
             return int(x)
     return 0
 
+def key_of(line):
+    if ":" not in line:
+        return ""
+    return line.split(":", 1)[0].split()[-1]
+
 def get_mem():
-    total = anon = slab = cache = 0
+    fields = {}
     with open(file_path) as f:
         for line in f:
-            if "MemTotal:" in line:
-                total = parse(line)
-            elif "AnonPages:" in line:
-                anon = parse(line)
-            elif "Active(anon):" in line or "Inactive(anon):" in line:
-                anon += parse(line)
-            elif "Slab:" in line:
-                slab = parse(line)
-            elif "Cached:" in line:
-                cache = parse(line)
+            fields[key_of(line)] = parse(line)
 
-    return total, anon + slab * 0.5 + cache * 0.2
+    total = fields.get("MemTotal", 0)
+    if node_id == "global":
+        available = fields.get(
+            "MemAvailable",
+            fields.get("MemFree", 0) + fields.get("Cached", 0) + fields.get("SReclaimable", 0),
+        )
+    else:
+        available = (
+            fields.get("MemFree", 0)
+            + fields.get("FilePages", 0)
+            + fields.get("SReclaimable", 0)
+        )
+
+    used = max(0, total - min(available, total))
+    return total, used
 
 total, _ = get_mem()
 SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
