@@ -170,7 +170,7 @@ PY
 # =============================================================================
 run_on_cpu() {
     taskset -c "$1" bash -c '
-STATE=$1; MIN=$2
+STATE=$1; MIN=$2; DURATION=$3
 
 psi() {
     [[ -f /proc/pressure/cpu ]] && awk "/some/ {print \$2}" /proc/pressure/cpu | cut -d= -f2 | cut -d. -f1 || echo 0
@@ -185,9 +185,9 @@ calibrate() {
 }
 
 L=$(calibrate)
-last=$SECONDS
+start=$SECONDS
 
-while true; do
+while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
     p=$(psi)
     (( p > 100 )) && p=100
 
@@ -204,7 +204,7 @@ while true; do
 
     idle=$((100 - p))
     (( idle > 0 )) && sleep "0.$idle"
-done' _ "$CPU_STATE_FILE" "$CPU_MIN" &
+done' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" &
 }
 
 # =============================================================================
