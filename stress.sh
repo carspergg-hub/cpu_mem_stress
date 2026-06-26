@@ -20,8 +20,17 @@ MEM_MAX=$6
 MEM_WAVE_SEC=$7
 DURATION=${8:-infinite}
 
-if ! [[ "$START_DELAY_MAX" =~ ^[0-9]+$ ]]; then
+is_non_negative_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+if ! is_non_negative_integer "$START_DELAY_MAX"; then
     echo "Error: <start_delay_max> must be a non-negative integer."
+    exit 1
+fi
+
+if [[ "$DURATION" != "infinite" ]] && ! is_non_negative_integer "$DURATION"; then
+    echo "Error: [duration] must be a non-negative integer or 'infinite'."
     exit 1
 fi
 
@@ -87,7 +96,14 @@ value_controller() {
 # memory worker（保持你原模型）
 # =============================================================================
 memory_worker() {
-exec python3 - "$1" "$2" "$3" <<'PY'
+    local node_id=$1 state_file=$2 duration=$3 preferred_node=${4:-}
+    local cmd=(python3 - "$node_id" "$state_file" "$duration")
+
+    if [[ -n "$preferred_node" ]]; then
+        cmd=(numactl --preferred="$preferred_node" "${cmd[@]}")
+    fi
+
+    exec "${cmd[@]}" <<'PY'
 import time, sys, signal
 
 node_id, state_file, duration = sys.argv[1:]
@@ -135,19 +151,31 @@ def get_mem():
     used = max(0, total - min(available, total))
     return total, used
 
+def duration_end(value):
+    if value == "infinite":
+        return float("inf")
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise SystemExit(f"invalid duration: {value}")
+    if seconds < 0:
+        raise SystemExit(f"invalid duration: {value}")
+    return time.time() + seconds
+
 total, _ = get_mem()
 SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
+PENALTY_STEP = 5
 
 pool = []
-start = time.time()
-end = float("inf") if duration == "infinite" else start + int(duration)
+end = duration_end(duration)
 
 penalty = 0
 
 while running and time.time() < end:
     try:
-        target_pct = int(open(state_file).read().strip())
-    except:
+        with open(state_file) as f:
+            target_pct = int(f.read().strip())
+    except (OSError, ValueError):
         target_pct = 0
 
     target_pct = max(0, target_pct - penalty)
@@ -155,17 +183,21 @@ while running and time.time() < end:
     target = min(total * target_pct / 100.0, total - SAFE_FREE)
 
     used = get_mem()[1]
+    memory_error = False
 
     if used < target:
         try:
             pool.append(bytearray(50 * 1024 * 1024))
-            penalty = max(0, penalty - 1)
         except MemoryError:
-            penalty += 5
+            penalty += PENALTY_STEP
+            memory_error = True
             time.sleep(5)
 
     elif used > target + 50 * 1024 and pool:
         pool.pop()
+
+    if not memory_error:
+        penalty = max(0, penalty - PENALTY_STEP)
 
     time.sleep(0.3)
 
@@ -213,7 +245,12 @@ while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
     for ((i=0;i<burn;i++)); do ((x=i*i)); done
 
     idle=$((100 - p))
-    (( idle > 0 )) && sleep "0.$idle"
+    if (( idle >= 100 )); then
+        sleep 1
+    elif (( idle > 0 )); then
+        printf -v idle_sec "0.%02d" "$idle"
+        sleep "$idle_sec"
+    fi
 done' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" &
 }
 
@@ -247,8 +284,7 @@ if command -v numactl >/dev/null 2>&1; then
 
             echo "[NUMA] node=$n"
 
-            numactl --preferred="$n" \
-            bash -c "$(declare -f memory_worker); memory_worker '$n' '$MEM_STATE_FILE' '$DURATION'" &
+            memory_worker "$n" "$MEM_STATE_FILE" "$DURATION" "$n" &
 
         else
             echo "[WARN] skip invalid NUMA node $n"
