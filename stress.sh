@@ -24,14 +24,63 @@ is_non_negative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_percent() {
+    is_non_negative_integer "$1" && (( 10#$1 <= 100 ))
+}
+
 if ! is_non_negative_integer "$START_DELAY_MAX"; then
     echo "Error: <start_delay_max> must be a non-negative integer."
+    exit 1
+fi
+
+if ! is_percent "$CPU_MIN" || ! is_percent "$CPU_MAX"; then
+    echo "Error: <cpu_min> and <cpu_max> must be integers in range 0-100."
+    exit 1
+fi
+
+if (( 10#$CPU_MIN > 10#$CPU_MAX )); then
+    echo "Error: <cpu_min> must be less than or equal to <cpu_max>."
+    exit 1
+fi
+
+if ! is_positive_integer "$CPU_WAVE_SEC"; then
+    echo "Error: <cpu_step> must be a positive integer."
+    exit 1
+fi
+
+if ! is_percent "$MEM_MIN" || ! is_percent "$MEM_MAX"; then
+    echo "Error: <mem_min> and <mem_max> must be integers in range 0-100."
+    exit 1
+fi
+
+if (( 10#$MEM_MIN > 10#$MEM_MAX )); then
+    echo "Error: <mem_min> must be less than or equal to <mem_max>."
+    exit 1
+fi
+
+if ! is_positive_integer "$MEM_WAVE_SEC"; then
+    echo "Error: <mem_step> must be a positive integer."
     exit 1
 fi
 
 if [[ "$DURATION" != "infinite" ]] && ! is_non_negative_integer "$DURATION"; then
     echo "Error: [duration] must be a non-negative integer or 'infinite'."
     exit 1
+fi
+
+START_DELAY_MAX=$((10#$START_DELAY_MAX))
+CPU_MIN=$((10#$CPU_MIN))
+CPU_MAX=$((10#$CPU_MAX))
+CPU_WAVE_SEC=$((10#$CPU_WAVE_SEC))
+MEM_MIN=$((10#$MEM_MIN))
+MEM_MAX=$((10#$MEM_MAX))
+MEM_WAVE_SEC=$((10#$MEM_WAVE_SEC))
+if [[ "$DURATION" != "infinite" ]]; then
+    DURATION=$((10#$DURATION))
 fi
 
 CPU_STATE_FILE="/dev/shm/cpu_p_$$"
@@ -42,6 +91,7 @@ MEM_STATE_FILE="/dev/shm/mem_p_$$"
 # =============================================================================
 cleanup() {
     trap '' SIGINT SIGTERM EXIT
+    rm -f "$CPU_STATE_FILE" "$MEM_STATE_FILE"
     kill -TERM -$$ 2>/dev/null || kill 0 2>/dev/null
     wait 2>/dev/null
     exit 0
@@ -60,17 +110,31 @@ expand_nodes() {
 
     for p in "${parts[@]}"; do
         if [[ "$p" == *-* ]]; then
-            start=${p%-*}
-            end=${p#*-}
+            local start=${p%-*}
+            local end=${p#*-}
 
-            # 防御非法输入
-            [[ -z "$start" || -z "$end" ]] && continue
+            if ! is_non_negative_integer "$start" || ! is_non_negative_integer "$end"; then
+                echo "[WARN] skip invalid NUMA node range $p" >&2
+                continue
+            fi
+
+            if (( 10#$start > 10#$end )); then
+                echo "[WARN] skip invalid NUMA node range $p" >&2
+                continue
+            fi
+
+            start=$((10#$start))
+            end=$((10#$end))
 
             for ((i=start;i<=end;i++)); do
                 out="$out $i"
             done
         else
-            out="$out $p"
+            if is_non_negative_integer "$p"; then
+                out="$out $((10#$p))"
+            else
+                echo "[WARN] skip invalid NUMA node $p" >&2
+            fi
         fi
     done
 
@@ -127,7 +191,8 @@ def parse(line):
 def key_of(line):
     if ":" not in line:
         return ""
-    return line.split(":", 1)[0].split()[-1]
+    parts = line.split(":", 1)[0].replace(",", " ").split()
+    return parts[-1] if parts else ""
 
 def get_mem():
     fields = {}
@@ -183,20 +248,20 @@ while running and time.time() < end:
     target = min(total * target_pct / 100.0, total - SAFE_FREE)
 
     used = get_mem()[1]
-    memory_error = False
+    allocated = False
 
     if used < target:
         try:
             pool.append(bytearray(50 * 1024 * 1024))
+            allocated = True
         except MemoryError:
             penalty += PENALTY_STEP
-            memory_error = True
             time.sleep(5)
 
     elif used > target + 50 * 1024 and pool:
         pool.pop()
 
-    if not memory_error:
+    if allocated:
         penalty = max(0, penalty - PENALTY_STEP)
 
     time.sleep(0.3)
@@ -215,7 +280,23 @@ run_on_cpu() {
 STATE=$1; MIN=$2; DURATION=$3
 
 psi() {
-    [[ -f /proc/pressure/cpu ]] && awk "/some/ {print \$2}" /proc/pressure/cpu | cut -d= -f2 | cut -d. -f1 || echo 0
+    local label fields field value
+    if [[ -r /proc/pressure/cpu ]]; then
+        while read -r label fields; do
+            if [[ "$label" == "some" ]]; then
+                for field in $fields; do
+                    case "$field" in
+                        avg10=*)
+                            value=${field#avg10=}
+                            echo "${value%%.*}"
+                            return
+                            ;;
+                    esac
+                done
+            fi
+        done < /proc/pressure/cpu
+    fi
+    echo 0
 }
 
 calibrate() {
