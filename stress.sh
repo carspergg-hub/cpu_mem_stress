@@ -6,18 +6,24 @@
 #   ✔ 支持 bitmap / range / list 混合格式
 # =============================================================================
 
-if [[ $# -lt 6 ]]; then
-    echo "Usage: $0 <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
+if [[ $# -lt 7 ]]; then
+    echo "Usage: $0 <start_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
     exit 1
 fi
 
-CPU_MIN=$1
-CPU_MAX=$2
-CPU_WAVE_SEC=$3
-MEM_MIN=$4
-MEM_MAX=$5
-MEM_WAVE_SEC=$6
-DURATION=${7:-infinite}
+START_DELAY_MAX=$1
+CPU_MIN=$2
+CPU_MAX=$3
+CPU_WAVE_SEC=$4
+MEM_MIN=$5
+MEM_MAX=$6
+MEM_WAVE_SEC=$7
+DURATION=${8:-infinite}
+
+if ! [[ "$START_DELAY_MAX" =~ ^[0-9]+$ ]]; then
+    echo "Error: <start_delay_max> must be a non-negative integer."
+    exit 1
+fi
 
 CPU_STATE_FILE="/dev/shm/cpu_p_$$"
 MEM_STATE_FILE="/dev/shm/mem_p_$$"
@@ -204,6 +210,12 @@ done' _ "$CPU_STATE_FILE" "$CPU_MIN" &
 # =============================================================================
 # start
 # =============================================================================
+if (( START_DELAY_MAX > 0 )); then
+    START_DELAY=$(( RANDOM % (START_DELAY_MAX + 1) ))
+    echo "[START_DELAY] sleep ${START_DELAY}s (range: 0-${START_DELAY_MAX}s)"
+    sleep "$START_DELAY"
+fi
+
 printf "%-3s\n" "$CPU_MIN" > "$CPU_STATE_FILE"
 printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
