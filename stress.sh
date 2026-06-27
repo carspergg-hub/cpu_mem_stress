@@ -6,19 +6,20 @@
 #   ✔ 支持 bitmap / range / list 混合格式
 # =============================================================================
 
-if [[ $# -lt 7 ]]; then
-    echo "Usage: $0 <start_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
+if [[ $# -lt 8 ]]; then
+    echo "Usage: $0 <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
     exit 1
 fi
 
 START_DELAY_MAX=$1
-CPU_MIN=$2
-CPU_MAX=$3
-CPU_WAVE_SEC=$4
-MEM_MIN=$5
-MEM_MAX=$6
-MEM_WAVE_SEC=$7
-DURATION=${8:-infinite}
+END_DELAY_MAX=$2
+CPU_MIN=$3
+CPU_MAX=$4
+CPU_WAVE_SEC=$5
+MEM_MIN=$6
+MEM_MAX=$7
+MEM_WAVE_SEC=$8
+DURATION=${9:-infinite}
 
 is_non_negative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
@@ -34,6 +35,11 @@ is_percent() {
 
 if ! is_non_negative_integer "$START_DELAY_MAX"; then
     echo "Error: <start_delay_max> must be a non-negative integer."
+    exit 1
+fi
+
+if ! is_non_negative_integer "$END_DELAY_MAX"; then
+    echo "Error: <end_delay_max> must be a non-negative integer."
     exit 1
 fi
 
@@ -73,6 +79,7 @@ if [[ "$DURATION" != "infinite" ]] && ! is_non_negative_integer "$DURATION"; the
 fi
 
 START_DELAY_MAX=$((10#$START_DELAY_MAX))
+END_DELAY_MAX=$((10#$END_DELAY_MAX))
 CPU_MIN=$((10#$CPU_MIN))
 CPU_MAX=$((10#$CPU_MAX))
 CPU_WAVE_SEC=$((10#$CPU_WAVE_SEC))
@@ -160,17 +167,17 @@ value_controller() {
 # memory worker（保持你原模型）
 # =============================================================================
 memory_worker() {
-    local node_id=$1 state_file=$2 duration=$3 preferred_node=${4:-}
-    local cmd=(python3 - "$node_id" "$state_file" "$duration")
+    local node_id=$1 state_file=$2 duration=$3 end_delay_max=$4 preferred_node=${5:-}
+    local cmd=(python3 - "$node_id" "$state_file" "$duration" "$end_delay_max")
 
     if [[ -n "$preferred_node" ]]; then
         cmd=(numactl --preferred="$preferred_node" "${cmd[@]}")
     fi
 
     exec "${cmd[@]}" <<'PY'
-import time, sys, signal
+import random, time, sys, signal
 
-node_id, state_file, duration = sys.argv[1:]
+node_id, state_file, duration, end_delay_max = sys.argv[1:]
 
 running = True
 def stop(*_):
@@ -227,6 +234,24 @@ def duration_end(value):
         raise SystemExit(f"invalid duration: {value}")
     return time.time() + seconds
 
+def exit_delay_seconds(value):
+    try:
+        max_delay = int(value)
+    except ValueError:
+        return 0
+    if duration == "infinite" or max_delay <= 0:
+        return 0
+    return random.randint(0, max_delay)
+
+def delay_before_release():
+    delay = exit_delay_seconds(end_delay_max)
+    if delay <= 0:
+        return
+    print(f"[END_DELAY] node={node_id} sleep {delay}s before release", flush=True)
+    deadline = time.time() + delay
+    while running and time.time() < deadline:
+        time.sleep(min(1, deadline - time.time()))
+
 total, _ = get_mem()
 SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
 PENALTY_STEP = 5
@@ -266,6 +291,9 @@ while running and time.time() < end:
 
     time.sleep(0.3)
 
+if running:
+    delay_before_release()
+
 while pool:
     pool.pop()
     time.sleep(0.01)
@@ -277,7 +305,7 @@ PY
 # =============================================================================
 run_on_cpu() {
     taskset -c "$1" bash -c '
-STATE=$1; MIN=$2; DURATION=$3
+STATE=$1; MIN=$2; DURATION=$3; END_DELAY_MAX=$4
 
 psi() {
     local label fields field value
@@ -332,7 +360,12 @@ while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
         printf -v idle_sec "0.%02d" "$idle"
         sleep "$idle_sec"
     fi
-done' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" &
+done
+
+if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
+    END_DELAY=$(( RANDOM % (END_DELAY_MAX + 1) ))
+    (( END_DELAY > 0 )) && sleep "$END_DELAY"
+fi' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" "$END_DELAY_MAX" &
 }
 
 # =============================================================================
@@ -365,7 +398,7 @@ if command -v numactl >/dev/null 2>&1; then
 
             echo "[NUMA] node=$n"
 
-            memory_worker "$n" "$MEM_STATE_FILE" "$DURATION" "$n" &
+            memory_worker "$n" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$n" &
 
         else
             echo "[WARN] skip invalid NUMA node $n"
@@ -374,7 +407,7 @@ if command -v numactl >/dev/null 2>&1; then
     done
 
 else
-    memory_worker "global" "$MEM_STATE_FILE" "$DURATION" &
+    memory_worker "global" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" &
 fi
 
 # CPU workers
