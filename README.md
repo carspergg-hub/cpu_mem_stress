@@ -54,7 +54,7 @@ chmod +x stress.sh
 ## 2. 使用方式
 
 ```bash
-./stress.sh <start_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
+./stress.sh <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
 ```
 
 ---
@@ -64,6 +64,7 @@ chmod +x stress.sh
 | 参数 | 说明 |
 |------|------|
 | start_delay_max | 启动前随机延迟上限（秒）。0 表示不延迟；60 表示随机延迟 0-60 秒 |
+| end_delay_max | 结束前随机延迟上限（秒）。0 表示不延迟；60 表示 duration 到期后随机延迟 0-60 秒再退出 |
 | cpu_min | CPU占用下限 (%) |
 | cpu_max | CPU占用上限 (%) |
 | cpu_step | CPU波动周期（秒） |
@@ -78,12 +79,12 @@ chmod +x stress.sh
 
 ## 场景A：容器弹性测试
 ```bash
-./stress.sh 0 10 90 2 60 80 30 300
+./stress.sh 0 60 10 90 2 60 80 30 300
 ```
 
 ## 场景B：数据库压力测试
 ```bash
-./stress.sh 60 60 75 5 85 95 10 600
+./stress.sh 60 120 60 75 5 85 95 10 600
 ```
 
 ---
