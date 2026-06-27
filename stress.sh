@@ -112,6 +112,7 @@ expand_nodes() {
     local input=$1
     local out=""
     local start end i p
+    local -a parts
 
     # 支持：0-1, 0,1, 0-3,8-10 混合
     IFS=',' read -ra parts <<< "$input"
@@ -248,8 +249,8 @@ def random_delay(delay_max):
         return 0
     return random.randint(0, delay_max)
 
-def sleep_until_release(delay, delay_max):
-    if delay_max <= 0 or delay <= 0:
+def sleep_until_release(delay):
+    if delay <= 0:
         return
     print(f"[END_DELAY] node={node_id} sleep {delay}s before release", flush=True)
     deadline = time.time() + delay
@@ -260,7 +261,10 @@ def sleep_until_release(delay, delay_max):
         time.sleep(min(1, remaining))
 
 total, _ = get_mem()
-SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
+SAFE_FREE_MIN_KB = 1024 * 1024  # Keep at least 1 GiB free to avoid host reclaim storms.
+ALLOC_CHUNK_BYTES = 50 * 1024 * 1024
+RELEASE_MARGIN_KB = 50 * 1024
+SAFE_FREE = max(int(total * 0.03), SAFE_FREE_MIN_KB)
 PENALTY_STEP = 5
 
 pool = []
@@ -284,13 +288,13 @@ while running and time.time() < end:
 
     if used < target:
         try:
-            pool.append(bytearray(50 * 1024 * 1024))
+            pool.append(bytearray(ALLOC_CHUNK_BYTES))
             allocated = True
         except MemoryError:
             penalty += PENALTY_STEP
             time.sleep(5)
 
-    elif used > target + 50 * 1024 and pool:
+    elif used > target + RELEASE_MARGIN_KB and pool:
         pool.pop()
 
     if allocated:
@@ -300,7 +304,8 @@ while running and time.time() < end:
 
 if running:
     delay_max = parse_delay_max(end_delay_max)
-    sleep_until_release(random_delay(delay_max), delay_max)
+    if delay_max > 0:
+        sleep_until_release(random_delay(delay_max))
 
 while pool:
     pool.pop()
@@ -422,8 +427,18 @@ else
 fi
 
 # CPU workers
-for c in $(seq 1 $(( $(nproc) - 1 ))); do
-    run_on_cpu "$c"
-done
+CPU_COUNT=$(nproc 2>/dev/null)
+if ! is_positive_integer "$CPU_COUNT"; then
+    echo "[WARN] failed to detect CPU count; skip CPU workers"
+    CPU_COUNT=1
+fi
+
+if (( CPU_COUNT <= 1 )); then
+    echo "[WARN] only one CPU detected; skip CPU workers to keep CPU0 reserved"
+else
+    for ((c=1; c<CPU_COUNT; c++)); do
+        run_on_cpu "$c"
+    done
+fi
 
 wait
