@@ -218,19 +218,21 @@ def reclaimable(fields):
 def file_cache(fields):
     return max(0, fields.get("FilePages", 0) - fields.get("Shmem", 0))
 
-def get_mem():
-    fields = read_fields(file_path)
-    total = fields.get("MemTotal", 0)
+def estimate_available(fields):
     if node_id == "global":
-        available = fields.get(
+        return fields.get(
             "MemAvailable",
             fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
         )
-    else:
-        # FilePages includes tmpfs/shmem. Count only the non-shmem portion as
-        # reclaimable file cache to avoid overstating per-node availability.
-        available = fields.get("MemFree", 0) + file_cache(fields) + reclaimable(fields)
 
+    # FilePages includes tmpfs/shmem. Count only the non-shmem portion as
+    # reclaimable file cache to avoid overstating per-node availability.
+    return fields.get("MemFree", 0) + file_cache(fields) + reclaimable(fields)
+
+def get_mem():
+    fields = read_fields(file_path)
+    total = fields.get("MemTotal", 0)
+    available = estimate_available(fields)
     used = max(0, total - min(available, total))
     return total, used
 
@@ -279,13 +281,26 @@ def sleep_until_release(delay):
             break
         time.sleep(min(1, remaining))
 
-total, _ = get_mem()
+start_fields = read_fields(file_path)
+total = start_fields.get("MemTotal", 0)
+start_available = estimate_available(start_fields)
+start_filepages = start_fields.get("FilePages", 0)
+start_shmem = start_fields.get("Shmem", 0)
+start_reclaimable = reclaimable(start_fields)
+start_file_cache = file_cache(start_fields)
+shmem_present = 1 if "Shmem" in start_fields else 0
 SAFE_FREE_MIN_KB = 1024 * 1024  # Keep at least 1 GiB free to avoid host reclaim storms.
 ALLOC_CHUNK_BYTES = 50 * 1024 * 1024
 RELEASE_MARGIN_KB = 50 * 1024
 SAFE_FREE = max(int(total * 0.03), SAFE_FREE_MIN_KB)
 PENALTY_STEP = 5
-print(f"[MEM_START] node={node_id} total_kb={total} safe_free_kb={SAFE_FREE}", flush=True)
+print(
+    f"[MEM_START] node={node_id} total_kb={total} available_kb={start_available} "
+    f"safe_free_kb={SAFE_FREE} filepages_kb={start_filepages} shmem_kb={start_shmem} "
+    f"shmem_present={shmem_present} file_cache_kb={start_file_cache} "
+    f"reclaimable_kb={start_reclaimable}",
+    flush=True,
+)
 
 pool = []
 end = duration_end(duration)
@@ -306,10 +321,12 @@ while running and time.time() < end:
 
     used = get_mem()[1]
     allocated = False
+    guard_blocked = False
 
     if used < target:
         available_global = global_available()
         if available_global < SAFE_FREE_MIN_KB:
+            guard_blocked = True
             penalty += PENALTY_STEP
             if not global_guard_logged:
                 print(
@@ -320,7 +337,6 @@ while running and time.time() < end:
                 global_guard_logged = True
             time.sleep(1)
         else:
-            global_guard_logged = False
             try:
                 pool.append(bytearray(ALLOC_CHUNK_BYTES))
                 allocated = True
@@ -330,6 +346,9 @@ while running and time.time() < end:
 
     elif used > target + RELEASE_MARGIN_KB and pool:
         pool.pop()
+
+    if not guard_blocked:
+        global_guard_logged = False
 
     if allocated:
         penalty = max(0, penalty - PENALTY_STEP)
