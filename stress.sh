@@ -191,6 +191,7 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 
 file_path = "/proc/meminfo" if node_id == "global" else f"/sys/devices/system/node/node{node_id}/meminfo"
+GLOBAL_MEMINFO = "/proc/meminfo"
 
 def parse(line):
     for x in reversed(line.split()):
@@ -204,27 +205,42 @@ def key_of(line):
     parts = line.split(":", 1)[0].split()
     return parts[-1] if parts else ""
 
-def get_mem():
+def read_fields(path):
     fields = {}
-    with open(file_path) as f:
+    with open(path) as f:
         for line in f:
             fields[key_of(line)] = parse(line)
+    return fields
 
+def reclaimable(fields):
+    return fields.get("KReclaimable", fields.get("SReclaimable", 0))
+
+def get_mem():
+    fields = read_fields(file_path)
     total = fields.get("MemTotal", 0)
     if node_id == "global":
         available = fields.get(
             "MemAvailable",
-            fields.get("MemFree", 0) + fields.get("Cached", 0) + fields.get("SReclaimable", 0),
+            fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
         )
     else:
-        available = (
-            fields.get("MemFree", 0)
-            + fields.get("FilePages", 0)
-            + fields.get("SReclaimable", 0)
-        )
+        # FilePages can be dominated by tmpfs/shmem on NUMA nodes, so do not treat
+        # it as safely reclaimable. Prefer a conservative per-node availability.
+        available = fields.get("MemFree", 0) + reclaimable(fields)
 
     used = max(0, total - min(available, total))
     return total, used
+
+def global_available():
+    try:
+        fields = read_fields(GLOBAL_MEMINFO)
+    except OSError:
+        return 0
+    available = fields.get(
+        "MemAvailable",
+        fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
+    )
+    return max(0, available)
 
 def duration_end(value):
     if value == "infinite":
@@ -266,11 +282,13 @@ ALLOC_CHUNK_BYTES = 50 * 1024 * 1024
 RELEASE_MARGIN_KB = 50 * 1024
 SAFE_FREE = max(int(total * 0.03), SAFE_FREE_MIN_KB)
 PENALTY_STEP = 5
+print(f"[MEM_START] node={node_id} total_kb={total} safe_free_kb={SAFE_FREE}", flush=True)
 
 pool = []
 end = duration_end(duration)
 
 penalty = 0
+global_guard_logged = False
 
 while running and time.time() < end:
     try:
@@ -287,12 +305,25 @@ while running and time.time() < end:
     allocated = False
 
     if used < target:
-        try:
-            pool.append(bytearray(ALLOC_CHUNK_BYTES))
-            allocated = True
-        except MemoryError:
+        available_global = global_available()
+        if available_global < SAFE_FREE_MIN_KB:
             penalty += PENALTY_STEP
-            time.sleep(5)
+            if not global_guard_logged:
+                print(
+                    f"[MEM_GUARD] node={node_id} global_available_kb={available_global} "
+                    f"below_safe_free_kb={SAFE_FREE_MIN_KB}; pause allocation",
+                    flush=True,
+                )
+                global_guard_logged = True
+            time.sleep(1)
+        else:
+            global_guard_logged = False
+            try:
+                pool.append(bytearray(ALLOC_CHUNK_BYTES))
+                allocated = True
+            except MemoryError:
+                penalty += PENALTY_STEP
+                time.sleep(5)
 
     elif used > target + RELEASE_MARGIN_KB and pool:
         pool.pop()
@@ -310,6 +341,8 @@ if running:
 while pool:
     pool.pop()
     time.sleep(0.01)
+
+print(f"[MEM_EXIT] node={node_id}", flush=True)
 PY
 }
 
