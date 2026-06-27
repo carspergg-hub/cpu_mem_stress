@@ -215,6 +215,9 @@ def read_fields(path):
 def reclaimable(fields):
     return fields.get("KReclaimable", fields.get("SReclaimable", 0))
 
+def file_cache(fields):
+    return max(0, fields.get("FilePages", 0) - fields.get("Shmem", 0))
+
 def get_mem():
     fields = read_fields(file_path)
     total = fields.get("MemTotal", 0)
@@ -224,9 +227,9 @@ def get_mem():
             fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
         )
     else:
-        # FilePages can be dominated by tmpfs/shmem on NUMA nodes, so do not treat
-        # it as safely reclaimable. Prefer a conservative per-node availability.
-        available = fields.get("MemFree", 0) + reclaimable(fields)
+        # FilePages includes tmpfs/shmem. Count only the non-shmem portion as
+        # reclaimable file cache to avoid overstating per-node availability.
+        available = fields.get("MemFree", 0) + file_cache(fields) + reclaimable(fields)
 
     used = max(0, total - min(available, total))
     return total, used
@@ -293,13 +296,13 @@ global_guard_logged = False
 while running and time.time() < end:
     try:
         with open(state_file) as f:
-            target_pct = int(f.read().strip())
+            requested_pct = int(f.read().strip())
     except (OSError, ValueError):
-        target_pct = 0
+        requested_pct = 0
 
-    target_pct = max(0, target_pct - penalty)
+    effective_pct = max(0, requested_pct - penalty)
 
-    target = min(total * target_pct / 100.0, total - SAFE_FREE)
+    target = max(0, min(total * effective_pct / 100.0, total - SAFE_FREE))
 
     used = get_mem()[1]
     allocated = False
@@ -330,6 +333,8 @@ while running and time.time() < end:
 
     if allocated:
         penalty = max(0, penalty - PENALTY_STEP)
+    elif penalty > 0:
+        penalty = max(0, penalty - 1)
 
     time.sleep(0.3)
 
