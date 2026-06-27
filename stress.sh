@@ -98,9 +98,9 @@ MEM_STATE_FILE="/dev/shm/mem_p_$$"
 # =============================================================================
 cleanup() {
     trap '' SIGINT SIGTERM EXIT
-    rm -f "$CPU_STATE_FILE" "$MEM_STATE_FILE"
     kill -TERM -$$ 2>/dev/null || kill 0 2>/dev/null
     wait 2>/dev/null
+    rm -f "$CPU_STATE_FILE" "$MEM_STATE_FILE"
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT
@@ -234,23 +234,30 @@ def duration_end(value):
         raise SystemExit(f"invalid duration: {value}")
     return time.time() + seconds
 
-def exit_delay_seconds(value):
+def parse_delay_max(value):
     try:
-        max_delay = int(value)
+        delay_max = int(value)
     except ValueError:
         return 0
-    if duration == "infinite" or max_delay <= 0:
-        return 0
-    return random.randint(0, max_delay)
+    return max(0, delay_max)
 
-def delay_before_release():
-    delay = exit_delay_seconds(end_delay_max)
-    if delay <= 0:
+def random_delay(delay_max):
+    if delay_max <= 0:
+        return 0
+    return random.randint(0, delay_max)
+
+def sleep_until_release(delay, delay_max):
+    if delay_max <= 0:
         return
     print(f"[END_DELAY] node={node_id} sleep {delay}s before release", flush=True)
+    if delay <= 0:
+        return
     deadline = time.time() + delay
-    while running and time.time() < deadline:
-        time.sleep(min(1, deadline - time.time()))
+    while running:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
 
 total, _ = get_mem()
 SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
@@ -292,7 +299,8 @@ while running and time.time() < end:
     time.sleep(0.3)
 
 if running:
-    delay_before_release()
+    delay_max = parse_delay_max(end_delay_max)
+    sleep_until_release(random_delay(delay_max), delay_max)
 
 while pool:
     pool.pop()
@@ -305,7 +313,7 @@ PY
 # =============================================================================
 run_on_cpu() {
     taskset -c "$1" bash -c '
-STATE=$1; MIN=$2; DURATION=$3; END_DELAY_MAX=$4
+STATE=$1; MIN=$2; DURATION=$3; END_DELAY_MAX=$4; CPU_ID=$5
 
 psi() {
     local label fields field value
@@ -364,8 +372,9 @@ done
 
 if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
     END_DELAY=$(( RANDOM % (END_DELAY_MAX + 1) ))
+    echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
     (( END_DELAY > 0 )) && sleep "$END_DELAY"
-fi' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" "$END_DELAY_MAX" &
+fi' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" "$END_DELAY_MAX" "$1" &
 }
 
 # =============================================================================
