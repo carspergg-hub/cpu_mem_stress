@@ -111,14 +111,15 @@ trap cleanup SIGINT SIGTERM EXIT
 expand_nodes() {
     local input=$1
     local out=""
+    local start end i p
 
     # 支持：0-1, 0,1, 0-3,8-10 混合
     IFS=',' read -ra parts <<< "$input"
 
     for p in "${parts[@]}"; do
         if [[ "$p" == *-* ]]; then
-            local start=${p%-*}
-            local end=${p#*-}
+            start=${p%-*}
+            end=${p#*-}
 
             if ! is_non_negative_integer "$start" || ! is_non_negative_integer "$end"; then
                 echo "[WARN] skip invalid NUMA node range $p" >&2
@@ -154,6 +155,7 @@ expand_nodes() {
 value_controller() {
     local min=$1 max=$2 step=$3 file=$4
     local start=$SECONDS
+    local val
 
     while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
         val=$min
@@ -198,7 +200,7 @@ def parse(line):
 def key_of(line):
     if ":" not in line:
         return ""
-    parts = line.split(":", 1)[0].replace(",", " ").split()
+    parts = line.split(":", 1)[0].split()
     return parts[-1] if parts else ""
 
 def get_mem():
@@ -247,11 +249,9 @@ def random_delay(delay_max):
     return random.randint(0, delay_max)
 
 def sleep_until_release(delay, delay_max):
-    if delay_max <= 0:
+    if delay_max <= 0 or delay <= 0:
         return
     print(f"[END_DELAY] node={node_id} sleep {delay}s before release", flush=True)
-    if delay <= 0:
-        return
     deadline = time.time() + delay
     while running:
         remaining = deadline - time.time()
@@ -372,8 +372,10 @@ done
 
 if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
     END_DELAY=$(( RANDOM % (END_DELAY_MAX + 1) ))
-    echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
-    (( END_DELAY > 0 )) && sleep "$END_DELAY"
+    if (( END_DELAY > 0 )); then
+        echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
+        sleep "$END_DELAY"
+    fi
 fi' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" "$END_DELAY_MAX" "$1" &
 }
 
