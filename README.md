@@ -1,144 +1,124 @@
-# Extreme Wave Stressor: 极速 CPU & Memory 压力波动发生器
+# CPU & Memory Stress Tool
 
-**Extreme Wave Stressor** 是一个面向云原生 / Cgroup / NUMA 架构的高精度 CPU & Memory 压力生成工具，用于模拟真实业务负载中的波动、突发与资源竞争行为。
+`stress.sh` is a Linux CPU and memory stress script designed for cloud, cgroup, and NUMA environments. It can keep CPU and memory usage near configured target ranges, while supporting randomized start and end delays for staggered test runs.
 
-相比传统 stress/stress-ng，该工具强调：
-- 波形控制（Wave-based Load）
-- CPU/Memory 解耦
-- NUMA 感知执行
-- 低调度误差与高时间稳定性
+## Features
 
----
+- CPU and memory targets are controlled independently.
+- CPU target is measured against the current process allowed CPU set from `Cpus_allowed_list`.
+- On unrestricted bare metal, the CPU target is equivalent to total host CPU usage.
+- In containers or cpuset-limited environments, only allowed CPUs are measured and stressed.
+- Memory workers are NUMA-aware when `numactl` is available.
+- Memory allocation uses safety guards to reduce reclaim and swap storms.
+- Finite `duration` exits cleanly and releases allocated memory.
+- Optional randomized `start_delay_max` and `end_delay_max` help stagger multiple stress processes.
 
-# ✨ 核心特性
+## Requirements
 
-## 🌊 双波形负载模型
-- CPU 与 Memory 独立控制器
-- 支持不同周期的动态波动
-- 可模拟真实业务流量突刺
+- Linux with `/proc/stat` and `/proc/self/status`
+- `bash`
+- `python3`
+- `taskset`
+- `nproc`
+- GNU `date` with `%N` support
+- `numactl` is optional, used for NUMA preferred placement when available
 
-## 🧠 NUMA 感知执行（V7.3+ 修复）
-- 自动读取 `/sys/devices/system/node/online`
-- 支持 Linux bitmap/range/list 格式解析（如 `0-1`, `0,2`, `0-3,8-10`）
-- 修复 node 越界问题（如 node 10 out of range）
+## Download
 
-## ⚙️ 内核级稳定设计
-- CPU0 默认保留给系统中断
-- /dev/shm 作为 IPC 通道
-- 10s 自动 recalibration
-- 防 CPU throttling 漂移
-
-## 🛡️ 内存安全机制
-- 自动 GC + 阶梯释放
-- 防 kswapd 风暴
-- 防 swap storm
-- MemoryError 自动退避
-
-## 🔄 动态校准机制
-- CPU burn loop 动态校准
-- 抗温控降频（thermal throttling）
-- 抗 Cgroup CPU 限流
-
----
-
-# 🚀 快速开始
-
-## 1. 下载
 ```bash
 wget https://raw.githubusercontent.com/carspergg-hub/cpu_mem_stress/refs/heads/main/stress.sh
 chmod +x stress.sh
 ```
 
----
-
-## 2. 使用方式
+## Usage
 
 ```bash
-./stress.sh <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
+./stress.sh <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
 ```
 
----
+## Parameters
 
-## 3. 参数说明
+| Parameter | Description |
+| --- | --- |
+| `start_delay_max` | Random startup delay upper bound in seconds. The script sleeps `0..start_delay_max` seconds before starting stress workers. |
+| `end_delay_max` | Random exit/release delay upper bound in seconds after finite `duration` ends. |
+| `cpu_min` | Lower CPU usage target percentage for the allowed CPU set. |
+| `cpu_max` | Upper CPU usage target percentage for the allowed CPU set. |
+| `cpu_step` | Seconds between random CPU target changes within `[cpu_min, cpu_max]`. |
+| `mem_min` | Lower estimated memory usage target percentage. |
+| `mem_max` | Upper estimated memory usage target percentage. |
+| `mem_step` | Seconds between random memory target changes within `[mem_min, mem_max]`. |
+| `duration` | Optional run duration in seconds. Use `infinite` or omit it to run until stopped. |
 
-| 参数 | 说明 |
-|------|------|
-| cpu_min | CPU占用下限 (%) |
-| cpu_max | CPU占用上限 (%) |
-| cpu_step | CPU波动周期（秒） |
-| mem_min | 内存占用下限 (%) |
-| mem_max | 内存占用上限 (%) |
-| mem_step | 内存波动周期（秒） |
-| duration | 运行时间（秒，可选） |
+`cpu_step` and `mem_step` are random target change intervals. They are not sine-wave or smooth ramp intervals.
 
----
+## Examples
 
-# 🎯 使用示例
-
-## 场景A：容器弹性测试
-```bash
-./stress.sh 10 90 2 60 80 30 300
-```
-
-## 场景B：数据库压力测试
-```bash
-./stress.sh 60 75 5 85 95 10 600
-```
-
----
-
-# ⚠️ NUMA 注意事项（V7.3+ 修复）
-
-系统 NUMA 节点不一定连续，可能出现：
-
-- 0-1（range）
-- 0,2（list）
-- 0-3,8-10（混合）
-
-因此必须使用 kernel bitmap 展开逻辑，而不是 ls 解析。
-
-已修复问题：
-```
-skip invalid NUMA node 0-1 ❌
-```
-
----
-
-# 🧪 架构说明
-
-```
-Main Process (CPU0 reserved)
-   ├── CPU Wave Controller → /dev/shm/cpu_p_$$
-   ├── MEM Wave Controller → /dev/shm/mem_p_$$
-   ├── Python Memory Worker → NUMA node workers
-   └── CPU Burn Workers → taskset pinned cores
-```
-
----
-
-# 🔥 V7.3.1 改进点
-
-### ✔ NUMA修复
-- 修复 bitmap/range 未展开问题
-- 修复 node 越界（0-1 被误判）
-
-### ✔ 稳定性增强
-- NUMA preferred 模式
-- 避免强绑定 membind
-
-### ✔ 兼容性增强
-- 支持 x86 / ARM / Kunpeng / Hygon
-
----
-
-# 🛑 停止方式
+Run for 2 hours, no start or end delay, keep CPU around 30-40%, keep memory around 55-75%, change CPU target every 300 seconds and memory target every 600 seconds:
 
 ```bash
-Ctrl + C
+./stress.sh 0 0 30 40 300 55 75 600 7200
+```
+
+Allow startup delay up to 60 seconds and exit delay up to 120 seconds:
+
+```bash
+./stress.sh 60 120 30 70 30 50 80 60 3600
+```
+
+Run until manually stopped:
+
+```bash
+./stress.sh 0 0 20 60 10 40 70 30
+```
+
+## CPU Target Semantics
+
+The CPU controller samples `/proc/stat` for the CPUs listed in `/proc/self/status` under `Cpus_allowed_list`. It adjusts worker load so the measured usage for that allowed CPU set stays near the selected target.
+
+If other processes are already using more CPU than `cpu_max`, the script can only reduce its own generated CPU pressure to zero. It cannot reduce CPU consumed by other processes.
+
+## Memory Target Semantics
+
+Memory workers estimate used memory as:
+
+- Global mode: based on `MemAvailable` when available.
+- NUMA mode: based on node `MemFree`, file cache, and reclaimable memory fields.
+
+If existing memory usage is already above `mem_max`, the script can only release memory allocated by itself. It cannot reclaim memory owned by other processes.
+
+The script keeps a safety reserve and pauses allocation when global available memory falls below the guard threshold.
+
+## NUMA Behavior
+
+When `numactl` is available, the script reads:
+
+```bash
+/sys/devices/system/node/online
+```
+
+It supports mixed node list formats such as:
+
+```text
+0-1
+0,2
+0-3,8-10
+```
+
+Each valid node gets a memory worker using `numactl --preferred=<node>`.
+
+## Stop
+
+```bash
+Ctrl+C
+```
+
+Or from another shell:
+
+```bash
 pkill -f stress.sh
 ```
 
----
+## License
 
-# 📜 License
 MIT License
