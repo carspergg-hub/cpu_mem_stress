@@ -1,9 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# CPU + Memory 压力测试脚本 (V7.3.2 NUMA bitmap 修复版)
-# 修复：
-#   ❌ 修复 NUMA online 输出 0-1 / 0-3 range 未解析问题
-#   ✔ 支持 bitmap / range / list 混合格式
+# CPU + Memory 压力测试脚本
+# CPU 目标语义：
+#   <cpu_min> <cpu_max> 表示加压后当前进程允许 CPU 集合的总使用率目标区间。
+#   裸机无限制时等价于整机总 CPU；容器/cpuset 场景下只统计 Cpus_allowed_list 内的 CPU。
+#   如果原有负载已经高于 cpu_max，脚本只能把自身 CPU 压力降到 0，不能降低其他进程的 CPU 使用率。
+# 内存目标语义：
+#   <mem_min> <mem_max> 表示加压后系统/NUMA 节点的估算已用内存目标区间。
+#   如果原有内存占用已经高于 mem_max，脚本只能释放自己申请的内存。
 # =============================================================================
 
 if [[ $# -lt 8 ]]; then
@@ -15,11 +19,16 @@ START_DELAY_MAX=$1
 END_DELAY_MAX=$2
 CPU_MIN=$3
 CPU_MAX=$4
-CPU_WAVE_SEC=$5
+CPU_CHANGE_SEC=$5
 MEM_MIN=$6
 MEM_MAX=$7
-MEM_WAVE_SEC=$8
+MEM_CHANGE_SEC=$8
 DURATION=${9:-infinite}
+
+die() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
 
 is_non_negative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
@@ -33,80 +42,78 @@ is_percent() {
     is_non_negative_integer "$1" && (( 10#$1 <= 100 ))
 }
 
-if ! is_non_negative_integer "$START_DELAY_MAX"; then
-    echo "Error: <start_delay_max> must be a non-negative integer."
-    exit 1
-fi
+require_cmd() {
+    local cmd=$1
+    command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
+}
 
-if ! is_non_negative_integer "$END_DELAY_MAX"; then
-    echo "Error: <end_delay_max> must be a non-negative integer."
-    exit 1
-fi
-
-if ! is_percent "$CPU_MIN" || ! is_percent "$CPU_MAX"; then
-    echo "Error: <cpu_min> and <cpu_max> must be integers in range 0-100."
-    exit 1
-fi
-
-if (( 10#$CPU_MIN > 10#$CPU_MAX )); then
-    echo "Error: <cpu_min> must be less than or equal to <cpu_max>."
-    exit 1
-fi
-
-if ! is_positive_integer "$CPU_WAVE_SEC"; then
-    echo "Error: <cpu_step> must be a positive integer."
-    exit 1
-fi
-
-if ! is_percent "$MEM_MIN" || ! is_percent "$MEM_MAX"; then
-    echo "Error: <mem_min> and <mem_max> must be integers in range 0-100."
-    exit 1
-fi
-
-if (( 10#$MEM_MIN > 10#$MEM_MAX )); then
-    echo "Error: <mem_min> must be less than or equal to <mem_max>."
-    exit 1
-fi
-
-if ! is_positive_integer "$MEM_WAVE_SEC"; then
-    echo "Error: <mem_step> must be a positive integer."
-    exit 1
-fi
-
-if [[ "$DURATION" != "infinite" ]] && ! is_non_negative_integer "$DURATION"; then
-    echo "Error: [duration] must be a non-negative integer or 'infinite'."
-    exit 1
+is_non_negative_integer "$START_DELAY_MAX" || die "start_delay_max must be a non-negative integer"
+is_non_negative_integer "$END_DELAY_MAX" || die "end_delay_max must be a non-negative integer"
+is_percent "$CPU_MIN" || die "cpu_min must be an integer between 0 and 100"
+is_percent "$CPU_MAX" || die "cpu_max must be an integer between 0 and 100"
+is_percent "$MEM_MIN" || die "mem_min must be an integer between 0 and 100"
+is_percent "$MEM_MAX" || die "mem_max must be an integer between 0 and 100"
+is_positive_integer "$CPU_CHANGE_SEC" || die "cpu_step must be a positive integer"
+is_positive_integer "$MEM_CHANGE_SEC" || die "mem_step must be a positive integer"
+if [[ "$DURATION" != "infinite" ]]; then
+    is_non_negative_integer "$DURATION" || die "duration must be a non-negative integer or 'infinite'"
 fi
 
 START_DELAY_MAX=$((10#$START_DELAY_MAX))
 END_DELAY_MAX=$((10#$END_DELAY_MAX))
 CPU_MIN=$((10#$CPU_MIN))
 CPU_MAX=$((10#$CPU_MAX))
-CPU_WAVE_SEC=$((10#$CPU_WAVE_SEC))
+CPU_CHANGE_SEC=$((10#$CPU_CHANGE_SEC))
 MEM_MIN=$((10#$MEM_MIN))
 MEM_MAX=$((10#$MEM_MAX))
-MEM_WAVE_SEC=$((10#$MEM_WAVE_SEC))
+MEM_CHANGE_SEC=$((10#$MEM_CHANGE_SEC))
 if [[ "$DURATION" != "infinite" ]]; then
     DURATION=$((10#$DURATION))
 fi
 
-CPU_STATE_FILE="/dev/shm/cpu_p_$$"
-MEM_STATE_FILE="/dev/shm/mem_p_$$"
+(( CPU_MIN <= CPU_MAX )) || die "cpu_min must be <= cpu_max"
+(( MEM_MIN <= MEM_MAX )) || die "mem_min must be <= mem_max"
+
+[[ -r /proc/stat ]] || die "/proc/stat is required; this script must run on Linux with procfs"
+[[ -r /proc/self/status ]] || die "/proc/self/status is required; this script must run on Linux with procfs"
+for cmd in taskset python3 nproc date; do
+    require_cmd "$cmd"
+done
+[[ "$(date +%s%N)" =~ ^[0-9]+$ ]] || die "GNU date with %N support is required"
+CPU_COUNT=$(nproc)
+is_positive_integer "$CPU_COUNT" || die "nproc returned an invalid CPU count: $CPU_COUNT"
+
+STATE_DIR=${STRESS_STATE_DIR:-/dev/shm}
+if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
+    STATE_DIR=/tmp
+fi
+[[ -d "$STATE_DIR" && -w "$STATE_DIR" ]] || die "no writable state directory found"
+
+CPU_STATE_FILE="$STATE_DIR/cpu_p_$$"
+MEM_STATE_FILE="$STATE_DIR/mem_p_$$"
+CHILD_PIDS=()
 
 # =============================================================================
 # cleanup
 # =============================================================================
 cleanup() {
-    trap '' SIGINT SIGTERM EXIT
-    kill -TERM -$$ 2>/dev/null || kill 0 2>/dev/null
-    wait 2>/dev/null
+    local exit_code=$?
+    local pid
+
+    trap - SIGINT SIGTERM EXIT
+
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    wait 2>/dev/null || true
     rm -f "$CPU_STATE_FILE" "$MEM_STATE_FILE"
-    exit 0
+    exit "$exit_code"
 }
 trap cleanup SIGINT SIGTERM EXIT
 
 # =============================================================================
-# NUMA bitmap parser（核心修复）
+# bitmap / range parser
 # =============================================================================
 expand_nodes() {
     local input=$1
@@ -114,7 +121,6 @@ expand_nodes() {
     local start end i p
     local -a parts
 
-    # 支持：0-1, 0,1, 0-3,8-10 混合
     IFS=',' read -ra parts <<< "$input"
 
     for p in "${parts[@]}"; do
@@ -123,17 +129,16 @@ expand_nodes() {
             end=${p#*-}
 
             if ! is_non_negative_integer "$start" || ! is_non_negative_integer "$end"; then
-                echo "[WARN] skip invalid NUMA node range $p" >&2
-                continue
-            fi
-
-            if (( 10#$start > 10#$end )); then
-                echo "[WARN] skip invalid NUMA node range $p" >&2
+                echo "[WARN] skip invalid range $p" >&2
                 continue
             fi
 
             start=$((10#$start))
             end=$((10#$end))
+            if (( start > end )); then
+                echo "[WARN] skip invalid range $p" >&2
+                continue
+            fi
 
             for ((i=start;i<=end;i++)); do
                 out="$out $i"
@@ -142,7 +147,7 @@ expand_nodes() {
             if is_non_negative_integer "$p"; then
                 out="$out $((10#$p))"
             else
-                echo "[WARN] skip invalid NUMA node $p" >&2
+                echo "[WARN] skip invalid value $p" >&2
             fi
         fi
     done
@@ -150,24 +155,154 @@ expand_nodes() {
     echo "$out"
 }
 
+get_allowed_cpus() {
+    local key value raw=""
+
+    while read -r key value; do
+        if [[ "$key" == "Cpus_allowed_list:" ]]; then
+            raw=$value
+            break
+        fi
+    done < /proc/self/status
+
+    [[ -n "$raw" ]] || raw="0-$(( CPU_COUNT - 1 ))"
+    expand_nodes "$raw"
+}
+
+within_duration() {
+    local start=$1
+    [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION ))
+}
+
+sleep_with_deadline() {
+    local seconds=$1 start=$2
+    local end=$(( SECONDS + seconds ))
+    local deadline remain
+
+    if [[ "$DURATION" != "infinite" ]]; then
+        deadline=$(( start + DURATION ))
+        (( end > deadline )) && end=$deadline
+    fi
+
+    while (( SECONDS < end )); do
+        remain=$(( end - SECONDS ))
+        (( remain < 1 )) && break
+        (( remain > 1 )) && sleep 1 || sleep "$remain"
+    done
+}
+
+random_delay() {
+    local delay_max=$1
+    (( delay_max > 0 )) && echo $(( RANDOM % (delay_max + 1) )) || echo 0
+}
+
 # =============================================================================
-# value controller
+# random target controller
 # =============================================================================
-value_controller() {
+random_value_controller() {
     local min=$1 max=$2 step=$3 file=$4
     local start=$SECONDS
     local val
 
-    while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+    while within_duration "$start"; do
         val=$min
         (( max > min )) && val=$(( RANDOM % (max - min + 1) + min ))
         echo "$val" > "$file"
-        sleep "$step"
+        sleep_with_deadline "$step" "$start"
     done
 }
 
 # =============================================================================
-# memory worker（保持你原模型）
+# total CPU controller
+# =============================================================================
+read_cpu_stat() {
+    local allowed_pattern=" $1 "
+    local total_idle=0 total_total=0
+    local cpu user nice system idle iowait irq softirq steal rest core_id
+    local idle_all non_idle
+
+    while read -r cpu user nice system idle iowait irq softirq steal rest; do
+        [[ "$cpu" =~ ^cpu([0-9]+)$ ]] || continue
+        core_id="${BASH_REMATCH[1]}"
+        [[ "$allowed_pattern" == *" $core_id "* ]] || continue
+
+        idle_all=$(( idle + iowait ))
+        non_idle=$(( user + nice + system + irq + softirq + steal ))
+        total_idle=$(( total_idle + idle_all ))
+        total_total=$(( total_total + idle_all + non_idle ))
+    done < /proc/stat
+
+    echo "$total_total $total_idle"
+}
+
+cpu_total_usage() {
+    local interval=${1:-1}
+    local allowed_cpus=$2
+    local total1 idle1 total2 idle2 total_delta idle_delta used_delta
+
+    read -r total1 idle1 < <(read_cpu_stat "$allowed_cpus")
+    sleep "$interval"
+    read -r total2 idle2 < <(read_cpu_stat "$allowed_cpus")
+
+    total_delta=$(( total2 - total1 ))
+    idle_delta=$(( idle2 - idle1 ))
+
+    if (( total_delta <= 0 )); then
+        echo 0
+        return
+    fi
+
+    used_delta=$(( total_delta - idle_delta ))
+    echo $(( (100 * used_delta + total_delta / 2) / total_delta ))
+}
+
+cpu_total_controller() {
+    local min=$1 max=$2 change_sec=$3 file=$4 allowed_cpus=$5
+    local start=$SECONDS
+    local next_change=$SECONDS
+    local target=$min
+    local load=0
+    local actual error adjust
+
+    printf "%-3s\n" "$load" > "$file"
+
+    while within_duration "$start"; do
+        if (( SECONDS >= next_change )); then
+            target=$min
+            (( max > min )) && target=$(( RANDOM % (max - min + 1) + min ))
+            next_change=$(( SECONDS + change_sec ))
+        fi
+
+        actual=$(cpu_total_usage 0.5 "$allowed_cpus")
+
+        read -r load < "$file"
+        load=${load%% *}
+        [[ "$load" =~ ^[0-9]+$ ]] || load=0
+
+        # Proportional controller with +/-2% deadband and +/-15 step cap.
+        error=$(( target - actual ))
+        if (( error > 2 )); then
+            adjust=$(( error / 3 ))
+            (( adjust < 1 )) && adjust=1
+            (( adjust > 15 )) && adjust=15
+        elif (( error < -2 )); then
+            adjust=$(( error / 3 ))
+            (( adjust > -1 )) && adjust=-1
+            (( adjust < -15 )) && adjust=-15
+        else
+            adjust=0
+        fi
+
+        load=$(( load + adjust ))
+        (( load < 0 )) && load=0
+        (( load > 100 )) && load=100
+
+        printf "%-3s\n" "$load" > "$file"
+    done
+}
+
+# =============================================================================
+# memory worker
 # =============================================================================
 memory_worker() {
     local node_id=$1 state_file=$2 duration=$3 end_delay_max=$4 preferred_node=${5:-}
@@ -209,7 +344,9 @@ def read_fields(path):
     fields = {}
     with open(path) as f:
         for line in f:
-            fields[key_of(line)] = parse(line)
+            key = key_of(line)
+            if key:
+                fields[key] = parse(line)
     return fields
 
 def reclaimable(fields):
@@ -225,8 +362,6 @@ def estimate_available(fields):
             fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
         )
 
-    # FilePages includes tmpfs/shmem. Count only the non-shmem portion as
-    # reclaimable file cache to avoid overstating per-node availability.
     return fields.get("MemFree", 0) + file_cache(fields) + reclaimable(fields)
 
 def get_mem():
@@ -289,7 +424,7 @@ start_shmem = start_fields.get("Shmem", 0)
 start_reclaimable = reclaimable(start_fields)
 start_file_cache = file_cache(start_fields)
 shmem_present = 1 if "Shmem" in start_fields else 0
-SAFE_FREE_MIN_KB = 1024 * 1024  # Keep at least 1 GiB free to avoid host reclaim storms.
+SAFE_FREE_MIN_KB = 1024 * 1024
 ALLOC_CHUNK_BYTES = 50 * 1024 * 1024
 RELEASE_MARGIN_KB = 50 * 1024
 SAFE_FREE = max(int(total * 0.03), SAFE_FREE_MIN_KB)
@@ -315,8 +450,7 @@ while running and time.time() < end:
     except (OSError, ValueError):
         requested_pct = 0
 
-    effective_pct = max(0, requested_pct - penalty)
-
+    effective_pct = max(0, min(100, requested_pct - penalty))
     target = max(0, min(total * effective_pct / 100.0, total - SAFE_FREE))
 
     used = get_mem()[1]
@@ -371,63 +505,47 @@ PY
 }
 
 # =============================================================================
-# CPU worker（PSI简化版）
+# CPU worker
 # =============================================================================
 run_on_cpu() {
     taskset -c "$1" bash -c '
-STATE=$1; MIN=$2; DURATION=$3; END_DELAY_MAX=$4; CPU_ID=$5
-
-psi() {
-    local label fields field value
-    if [[ -r /proc/pressure/cpu ]]; then
-        while read -r label fields; do
-            if [[ "$label" == "some" ]]; then
-                for field in $fields; do
-                    case "$field" in
-                        avg10=*)
-                            value=${field#avg10=}
-                            echo "${value%%.*}"
-                            return
-                            ;;
-                    esac
-                done
-            fi
-        done < /proc/pressure/cpu
-    fi
-    echo 0
-}
+STATE=$1
+DURATION=$2
+END_DELAY_MAX=$3
+CPU_ID=$4
+start=$SECONDS
 
 calibrate() {
-    local n=5000 s e
+    local n=5000 s e elapsed
     s=$(date +%s%N)
     for ((i=0;i<n;i++)); do ((x=i*i)); done
     e=$(date +%s%N)
-    echo $(( n / ((e-s)/1000000 + 1) ))
+    elapsed=$(( (e - s) / 1000000 + 1 ))
+    echo $(( n / elapsed ))
 }
 
 L=$(calibrate)
-start=$SECONDS
+next_calibrate=$(( SECONDS + 30 ))
 
 while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
-    p=$(psi)
-    (( p > 100 )) && p=100
+    if (( SECONDS >= next_calibrate )); then
+        L=$(calibrate)
+        next_calibrate=$(( SECONDS + 30 ))
+    fi
 
     read -r v < "$STATE"
     v=${v%% *}
-    [[ "$v" =~ ^[0-9]+$ ]] || v=$MIN
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
 
-    p=$(( v + p/10 ))
-    (( p > 100 )) && p=100
+    (( v < 0 )) && v=0
+    (( v > 100 )) && v=100
 
-    burn=$(( p * L * 10 ))
-
+    burn=$(( v * L ))
     for ((i=0;i<burn;i++)); do ((x=i*i)); done
 
-    idle=$((100 - p))
-    if (( idle >= 100 )); then
-        sleep 1
-    elif (( idle > 0 )); then
-        printf -v idle_sec "0.%02d" "$idle"
+    idle_ms=$((100 - v))
+    if (( idle_ms > 0 )); then
+        printf -v idle_sec "0.%03d" "$idle_ms"
         sleep "$idle_sec"
     fi
 done
@@ -438,26 +556,33 @@ if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
         echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
         sleep "$END_DELAY"
     fi
-fi' _ "$CPU_STATE_FILE" "$CPU_MIN" "$DURATION" "$END_DELAY_MAX" "$1" &
+fi' _ "$CPU_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$1" &
+    CHILD_PIDS+=("$!")
 }
 
 # =============================================================================
 # start
 # =============================================================================
 if (( START_DELAY_MAX > 0 )); then
-    START_DELAY=$(( RANDOM % (START_DELAY_MAX + 1) ))
+    START_DELAY=$(random_delay "$START_DELAY_MAX")
     echo "[START_DELAY] sleep ${START_DELAY}s (range: 0-${START_DELAY_MAX}s)"
     sleep "$START_DELAY"
 fi
 
-printf "%-3s\n" "$CPU_MIN" > "$CPU_STATE_FILE"
+printf "%-3s\n" "0" > "$CPU_STATE_FILE"
 printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
-value_controller "$CPU_MIN" "$CPU_MAX" "$CPU_WAVE_SEC" "$CPU_STATE_FILE" &
-value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_WAVE_SEC" "$MEM_STATE_FILE" &
+read -ra CPU_ARRAY <<< "$(get_allowed_cpus)"
+(( ${#CPU_ARRAY[@]} > 0 )) || die "no allowed CPUs found"
+ALLOWED_CPUS="${CPU_ARRAY[*]}"
+
+cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" "$ALLOWED_CPUS" &
+CHILD_PIDS+=("$!")
+random_value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_CHANGE_SEC" "$MEM_STATE_FILE" &
+CHILD_PIDS+=("$!")
 
 # =============================================================================
-# NUMA FIX (核心修复点)
+# NUMA
 # =============================================================================
 if command -v numactl >/dev/null 2>&1; then
 
@@ -466,13 +591,10 @@ if command -v numactl >/dev/null 2>&1; then
 
     for n in $(expand_nodes "$NODE_RAW"); do
 
-        # 防御非法 node
         if [[ -d /sys/devices/system/node/node$n ]]; then
-
             echo "[NUMA] node=$n"
-
             memory_worker "$n" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$n" &
-
+            CHILD_PIDS+=("$!")
         else
             echo "[WARN] skip invalid NUMA node $n"
         fi
@@ -481,21 +603,12 @@ if command -v numactl >/dev/null 2>&1; then
 
 else
     memory_worker "global" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" &
+    CHILD_PIDS+=("$!")
 fi
 
 # CPU workers
-CPU_COUNT=$(nproc 2>/dev/null)
-if ! is_positive_integer "$CPU_COUNT"; then
-    echo "[WARN] failed to detect CPU count; skip CPU workers"
-    CPU_COUNT=1
-fi
-
-if (( CPU_COUNT <= 1 )); then
-    echo "[WARN] only one CPU detected; skip CPU workers to keep CPU0 reserved"
-else
-    for ((c=1; c<CPU_COUNT; c++)); do
-        run_on_cpu "$c"
-    done
-fi
+for c in "${CPU_ARRAY[@]}"; do
+    run_on_cpu "$c"
+done
 
 wait
