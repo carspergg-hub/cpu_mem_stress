@@ -193,7 +193,11 @@ sleep_with_deadline() {
 
 random_delay() {
     local delay_max=$1
-    (( delay_max > 0 )) && echo $(( RANDOM % (delay_max + 1) )) || echo 0
+    if (( delay_max > 0 )); then
+        echo $(( RANDOM % (delay_max + 1) ))
+    else
+        echo 0
+    fi
 }
 
 # =============================================================================
@@ -216,33 +220,24 @@ random_value_controller() {
 # total CPU controller
 # =============================================================================
 read_cpu_stat() {
-    local allowed_pattern=" $1 "
-    local total_idle=0 total_total=0
-    local cpu user nice system idle iowait irq softirq steal rest core_id
-    local idle_all non_idle
+    local cpu user nice system idle iowait irq softirq steal rest
 
-    while read -r cpu user nice system idle iowait irq softirq steal rest; do
-        [[ "$cpu" =~ ^cpu([0-9]+)$ ]] || continue
-        core_id="${BASH_REMATCH[1]}"
-        [[ "$allowed_pattern" == *" $core_id "* ]] || continue
+    read -r cpu user nice system idle iowait irq softirq steal rest < /proc/stat
 
-        idle_all=$(( idle + iowait ))
-        non_idle=$(( user + nice + system + irq + softirq + steal ))
-        total_idle=$(( total_idle + idle_all ))
-        total_total=$(( total_total + idle_all + non_idle ))
-    done < /proc/stat
+    local idle_all=$(( idle + iowait ))
+    local non_idle=$(( user + nice + system + irq + softirq + steal ))
+    local total=$(( idle_all + non_idle ))
 
-    echo "$total_total $total_idle"
+    echo "$total $idle_all"
 }
 
 cpu_total_usage() {
     local interval=${1:-1}
-    local allowed_cpus=$2
     local total1 idle1 total2 idle2 total_delta idle_delta used_delta
 
-    read -r total1 idle1 < <(read_cpu_stat "$allowed_cpus")
+    read -r total1 idle1 < <(read_cpu_stat)
     sleep "$interval"
-    read -r total2 idle2 < <(read_cpu_stat "$allowed_cpus")
+    read -r total2 idle2 < <(read_cpu_stat)
 
     total_delta=$(( total2 - total1 ))
     idle_delta=$(( idle2 - idle1 ))
@@ -257,7 +252,7 @@ cpu_total_usage() {
 }
 
 cpu_total_controller() {
-    local min=$1 max=$2 change_sec=$3 file=$4 allowed_cpus=$5
+    local min=$1 max=$2 change_sec=$3 file=$4
     local start=$SECONDS
     local next_change=$SECONDS
     local target=$min
@@ -273,7 +268,7 @@ cpu_total_controller() {
             next_change=$(( SECONDS + change_sec ))
         fi
 
-        actual=$(cpu_total_usage 0.5 "$allowed_cpus")
+        actual=$(cpu_total_usage 0.5)
 
         read -r load < "$file"
         load=${load%% *}
@@ -583,9 +578,8 @@ printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
 read -ra CPU_ARRAY <<< "$(get_allowed_cpus)"
 (( ${#CPU_ARRAY[@]} > 0 )) || die "no allowed CPUs found"
-ALLOWED_CPUS="${CPU_ARRAY[*]}"
 
-cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" "$ALLOWED_CPUS" &
+cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" &
 CHILD_PIDS+=("$!")
 random_value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_CHANGE_SEC" "$MEM_STATE_FILE" &
 CHILD_PIDS+=("$!")
