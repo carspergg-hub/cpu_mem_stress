@@ -35,7 +35,7 @@ is_non_negative_integer() {
 }
 
 is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 ))
 }
 
 is_percent() {
@@ -56,7 +56,7 @@ is_percent "$MEM_MAX" || die "mem_max must be an integer between 0 and 100"
 is_positive_integer "$CPU_CHANGE_SEC" || die "cpu_step must be a positive integer"
 is_positive_integer "$MEM_CHANGE_SEC" || die "mem_step must be a positive integer"
 if [[ "$DURATION" != "infinite" ]]; then
-    is_non_negative_integer "$DURATION" || die "duration must be a non-negative integer or 'infinite'"
+    is_positive_integer "$DURATION" || die "duration must be a positive integer or 'infinite'"
 fi
 
 START_DELAY_MAX=$((10#$START_DELAY_MAX))
@@ -527,7 +527,12 @@ calibrate() {
 L=$(calibrate)
 next_calibrate=$(( SECONDS + 30 ))
 
+_terminated=0
+trap "_terminated=1" TERM
+
 while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+    (( _terminated )) && break
+
     if (( SECONDS >= next_calibrate )); then
         L=$(calibrate)
         next_calibrate=$(( SECONDS + 30 ))
@@ -550,11 +555,15 @@ while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
     fi
 done
 
-if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
+if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )) && ! (( _terminated )); then
     END_DELAY=$(( RANDOM % (END_DELAY_MAX + 1) ))
     if (( END_DELAY > 0 )); then
         echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
-        sleep "$END_DELAY"
+        # 可中断的 END_DELAY：每秒检查 SIGTERM
+        end_at=$(( SECONDS + END_DELAY ))
+        while (( SECONDS < end_at )) && ! (( _terminated )); do
+            sleep 1
+        done
     fi
 fi' _ "$CPU_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$1" &
     CHILD_PIDS+=("$!")
