@@ -3,14 +3,14 @@
 # CPU + Memory 压力测试脚本
 # CPU 目标语义：
 #   <cpu_min> <cpu_max> 表示加压后当前进程允许 CPU 集合的总使用率目标区间。
-#   裸机无限制时等价于整机总 CPU；容器/cpuset 场景下只统计 Cpus_allowed_list 内的 CPU。
+#   裸机无限制时等价于整机总 CPU；如果进程被限制到部分 CPU，则只统计 Cpus_allowed_list 内的 CPU。
 #   如果原有负载已经高于 cpu_max，脚本只能把自身 CPU 压力降到 0，不能降低其他进程的 CPU 使用率。
 # 内存目标语义：
 #   <mem_min> <mem_max> 表示加压后系统/NUMA 节点的估算已用内存目标区间。
 #   如果原有内存占用已经高于 mem_max，脚本只能释放自己申请的内存。
 # =============================================================================
 
-if [[ $# -lt 8 ]]; then
+if (( $# < 8 || $# > 9 )); then
     echo "Usage: $0 <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
     exit 1
 fi
