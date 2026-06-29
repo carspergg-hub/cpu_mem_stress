@@ -2,9 +2,9 @@
 # =============================================================================
 # CPU + Memory 压力测试脚本
 # CPU 目标语义：
-#   <cpu_min> <cpu_max> 表示加压后整机总 CPU 使用率目标区间。
-#   如果系统原有负载已经高于 cpu_max，脚本只能把自身 CPU 压力降到 0，
-#   不能降低其他进程的 CPU 使用率。
+#   <cpu_min> <cpu_max> 表示加压后当前进程允许 CPU 集合的总使用率目标区间。
+#   裸机无限制时等价于整机总 CPU；容器/cpuset 场景下只统计 Cpus_allowed_list 内的 CPU。
+#   如果原有负载已经高于 cpu_max，脚本只能把自身 CPU 压力降到 0，不能降低其他进程的 CPU 使用率。
 # 内存目标语义：
 #   <mem_min> <mem_max> 表示加压后系统/NUMA 节点的估算已用内存目标区间。
 #   如果原有内存占用已经高于 mem_max，脚本只能释放自己申请的内存。
@@ -159,6 +159,7 @@ sleep_with_deadline() {
 
     while (( SECONDS < end )); do
         remain=$(( end - SECONDS ))
+        (( remain < 1 )) && break
         (( remain > 1 )) && sleep 1 || sleep "$remain"
     done
 }
@@ -182,24 +183,33 @@ random_value_controller() {
 # total CPU controller
 # =============================================================================
 read_cpu_stat() {
-    local cpu user nice system idle iowait irq softirq steal guest guest_nice
+    local allowed_pattern=" $1 "
+    local total_idle=0 total_total=0
+    local cpu user nice system idle iowait irq softirq steal rest core_id
+    local idle_all non_idle
 
-    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    while read -r cpu user nice system idle iowait irq softirq steal rest; do
+        [[ "$cpu" =~ ^cpu([0-9]+)$ ]] || continue
+        core_id="${BASH_REMATCH[1]}"
+        [[ "$allowed_pattern" == *" $core_id "* ]] || continue
 
-    local idle_all=$(( idle + iowait ))
-    local non_idle=$(( user + nice + system + irq + softirq + steal ))
-    local total=$(( idle_all + non_idle ))
+        idle_all=$(( idle + iowait ))
+        non_idle=$(( user + nice + system + irq + softirq + steal ))
+        total_idle=$(( total_idle + idle_all ))
+        total_total=$(( total_total + idle_all + non_idle ))
+    done < /proc/stat
 
-    echo "$total $idle_all"
+    echo "$total_total $total_idle"
 }
 
 cpu_total_usage() {
     local interval=${1:-1}
+    local allowed_cpus=$2
     local total1 idle1 total2 idle2 total_delta idle_delta used_delta
 
-    read -r total1 idle1 < <(read_cpu_stat)
+    read -r total1 idle1 < <(read_cpu_stat "$allowed_cpus")
     sleep "$interval"
-    read -r total2 idle2 < <(read_cpu_stat)
+    read -r total2 idle2 < <(read_cpu_stat "$allowed_cpus")
 
     total_delta=$(( total2 - total1 ))
     idle_delta=$(( idle2 - idle1 ))
@@ -214,7 +224,7 @@ cpu_total_usage() {
 }
 
 cpu_total_controller() {
-    local min=$1 max=$2 change_sec=$3 file=$4
+    local min=$1 max=$2 change_sec=$3 file=$4 allowed_cpus=$5
     local start=$SECONDS
     local next_change=$SECONDS
     local target=$min
@@ -223,14 +233,14 @@ cpu_total_controller() {
 
     printf "%-3s\n" "$load" > "$file"
 
-    while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+    while within_duration "$start"; do
         if (( SECONDS >= next_change )); then
             target=$min
             (( max > min )) && target=$(( RANDOM % (max - min + 1) + min ))
             next_change=$(( SECONDS + change_sec ))
         fi
 
-        actual=$(cpu_total_usage 0.5)
+        actual=$(cpu_total_usage 0.5 "$allowed_cpus")
 
         read -r load < "$file"
         load=${load%% *}
@@ -405,7 +415,11 @@ done' _ "$CPU_STATE_FILE" "$DURATION" &
 printf "%-3s\n" "0" > "$CPU_STATE_FILE"
 printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
-cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" &
+read -ra CPU_ARRAY <<< "$(get_allowed_cpus)"
+(( ${#CPU_ARRAY[@]} > 0 )) || die "no allowed CPUs found"
+ALLOWED_CPUS="${CPU_ARRAY[*]}"
+
+cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" "$ALLOWED_CPUS" &
 CHILD_PIDS+=("$!")
 random_value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_CHANGE_SEC" "$MEM_STATE_FILE" &
 CHILD_PIDS+=("$!")
@@ -441,9 +455,7 @@ else
 fi
 
 # CPU workers
-CPU_LIST=$(get_allowed_cpus)
-[[ -n "$CPU_LIST" ]] || die "no allowed CPUs found"
-for c in $CPU_LIST; do
+for c in "${CPU_ARRAY[@]}"; do
     run_on_cpu "$c"
 done
 
