@@ -1,9 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# CPU + Memory 压力测试脚本 (V7.3.2 NUMA bitmap 修复版)
-# 修复：
-#   ❌ 修复 NUMA online 输出 0-1 / 0-3 range 未解析问题
-#   ✔ 支持 bitmap / range / list 混合格式
+# CPU + Memory 压力测试脚本
+# CPU 目标语义：
+#   <cpu_min> <cpu_max> 表示加压后整机总 CPU 使用率目标区间。
+#   如果系统原有负载已经高于 cpu_max，脚本只能把自身 CPU 压力降到 0，
+#   不能降低其他进程的 CPU 使用率。
+# 内存目标语义：
+#   <mem_min> <mem_max> 表示加压后系统/NUMA 节点的估算已用内存目标区间。
+#   如果原有内存占用已经高于 mem_max，脚本只能释放自己申请的内存。
 # =============================================================================
 
 if [[ $# -lt 6 ]]; then
@@ -13,28 +17,89 @@ fi
 
 CPU_MIN=$1
 CPU_MAX=$2
-CPU_WAVE_SEC=$3
+CPU_CHANGE_SEC=$3
 MEM_MIN=$4
 MEM_MAX=$5
-MEM_WAVE_SEC=$6
+MEM_CHANGE_SEC=$6
 DURATION=${7:-infinite}
 
-CPU_STATE_FILE="/dev/shm/cpu_p_$$"
-MEM_STATE_FILE="/dev/shm/mem_p_$$"
+die() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+is_uint() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_percent() {
+    local name=$1 value=$2
+    is_uint "$value" || die "$name must be an integer between 0 and 100"
+    (( value >= 0 && value <= 100 )) || die "$name must be between 0 and 100"
+}
+
+validate_positive_int() {
+    local name=$1 value=$2
+    is_uint "$value" || die "$name must be a positive integer"
+    (( value > 0 )) || die "$name must be greater than 0"
+}
+
+require_cmd() {
+    local cmd=$1
+    command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
+}
+
+validate_percent "cpu_min" "$CPU_MIN"
+validate_percent "cpu_max" "$CPU_MAX"
+validate_percent "mem_min" "$MEM_MIN"
+validate_percent "mem_max" "$MEM_MAX"
+(( CPU_MIN <= CPU_MAX )) || die "cpu_min must be <= cpu_max"
+(( MEM_MIN <= MEM_MAX )) || die "mem_min must be <= mem_max"
+validate_positive_int "cpu_step" "$CPU_CHANGE_SEC"
+validate_positive_int "mem_step" "$MEM_CHANGE_SEC"
+if [[ "$DURATION" != "infinite" ]]; then
+    validate_positive_int "duration" "$DURATION"
+fi
+
+[[ -r /proc/stat ]] || die "/proc/stat is required; this script must run on Linux with procfs"
+for cmd in taskset python3 nproc date seq; do
+    require_cmd "$cmd"
+done
+[[ "$(date +%s%N)" =~ ^[0-9]+$ ]] || die "GNU date with %N support is required"
+CPU_COUNT=$(nproc)
+is_uint "$CPU_COUNT" && (( CPU_COUNT > 0 )) || die "nproc returned an invalid CPU count: $CPU_COUNT"
+
+STATE_DIR=${STRESS_STATE_DIR:-/dev/shm}
+if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
+    STATE_DIR=/tmp
+fi
+[[ -d "$STATE_DIR" && -w "$STATE_DIR" ]] || die "no writable state directory found"
+
+CPU_STATE_FILE="$STATE_DIR/cpu_p_$$"
+MEM_STATE_FILE="$STATE_DIR/mem_p_$$"
+CHILD_PIDS=()
 
 # =============================================================================
 # cleanup
 # =============================================================================
 cleanup() {
-    trap '' SIGINT SIGTERM EXIT
-    kill -TERM -$$ 2>/dev/null || kill 0 2>/dev/null
-    wait 2>/dev/null
-    exit 0
+    local exit_code=$?
+    local pid
+
+    trap - SIGINT SIGTERM EXIT
+
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    wait 2>/dev/null || true
+    rm -f "$CPU_STATE_FILE" "$MEM_STATE_FILE"
+    exit "$exit_code"
 }
 trap cleanup SIGINT SIGTERM EXIT
 
 # =============================================================================
-# NUMA bitmap parser（核心修复）
+# NUMA bitmap parser
 # =============================================================================
 expand_nodes() {
     local input=$1
@@ -63,9 +128,9 @@ expand_nodes() {
 }
 
 # =============================================================================
-# value controller
+# random target controller
 # =============================================================================
-value_controller() {
+random_value_controller() {
     local min=$1 max=$2 step=$3 file=$4
     local start=$SECONDS
 
@@ -78,7 +143,89 @@ value_controller() {
 }
 
 # =============================================================================
-# memory worker（保持你原模型）
+# total CPU controller
+# =============================================================================
+read_cpu_stat() {
+    local cpu user nice system idle iowait irq softirq steal guest guest_nice
+
+    read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+
+    local idle_all=$(( idle + iowait ))
+    local non_idle=$(( user + nice + system + irq + softirq + steal ))
+    local total=$(( idle_all + non_idle ))
+
+    echo "$total $idle_all"
+}
+
+cpu_total_usage() {
+    local interval=${1:-1}
+    local total1 idle1 total2 idle2 total_delta idle_delta used_delta
+
+    read -r total1 idle1 < <(read_cpu_stat)
+    sleep "$interval"
+    read -r total2 idle2 < <(read_cpu_stat)
+
+    total_delta=$(( total2 - total1 ))
+    idle_delta=$(( idle2 - idle1 ))
+
+    if (( total_delta <= 0 )); then
+        echo 0
+        return
+    fi
+
+    used_delta=$(( total_delta - idle_delta ))
+    echo $(( (100 * used_delta + total_delta / 2) / total_delta ))
+}
+
+cpu_total_controller() {
+    local min=$1 max=$2 change_sec=$3 file=$4
+    local start=$SECONDS
+    local next_change=$SECONDS
+    local target=$min
+    local load=0
+    local actual error adjust
+
+    printf "%-3s\n" "$load" > "$file"
+
+    while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+        if (( SECONDS >= next_change )); then
+            target=$min
+            (( max > min )) && target=$(( RANDOM % (max - min + 1) + min ))
+            next_change=$(( SECONDS + change_sec ))
+        fi
+
+        actual=$(cpu_total_usage 1)
+
+        read -r load < "$file"
+        load=${load%% *}
+        [[ "$load" =~ ^[0-9]+$ ]] || load=0
+
+        if (( actual < min )); then
+            error=$(( target - actual ))
+            (( error < 1 )) && error=1
+            adjust=$error
+        elif (( actual > max )); then
+            error=$(( actual - target ))
+            (( error < 1 )) && error=1
+            adjust=$(( -error ))
+        elif (( actual < target - 2 )); then
+            adjust=1
+        elif (( actual > target + 2 )); then
+            adjust=-1
+        else
+            adjust=0
+        fi
+
+        load=$(( load + adjust ))
+        (( load < 0 )) && load=0
+        (( load > 100 )) && load=100
+
+        printf "%-3s\n" "$load" > "$file"
+    done
+}
+
+# =============================================================================
+# memory worker
 # =============================================================================
 memory_worker() {
 exec python3 - "$1" "$2" "$3" <<'PY'
@@ -102,22 +249,34 @@ def parse(line):
             return int(x)
     return 0
 
+def meminfo_key(line):
+    return line.split(":", 1)[0].split(",")[-1].strip()
+
 def get_mem():
-    total = anon = slab = cache = 0
+    values = {}
+
     with open(file_path) as f:
         for line in f:
-            if "MemTotal:" in line:
-                total = parse(line)
-            elif "AnonPages:" in line:
-                anon = parse(line)
-            elif "Active(anon):" in line or "Inactive(anon):" in line:
-                anon += parse(line)
-            elif "Slab:" in line:
-                slab = parse(line)
-            elif "Cached:" in line:
-                cache = parse(line)
+            if ":" in line:
+                values[meminfo_key(line)] = parse(line)
 
-    return total, anon + slab * 0.5 + cache * 0.2
+    total = values.get("MemTotal", 0)
+    if total <= 0:
+        return 0, 0
+
+    if "MemAvailable" in values:
+        used = total - values["MemAvailable"]
+    else:
+        free = values.get("MemFree", 0)
+        file_pages = values.get("FilePages", values.get("Cached", 0))
+        reclaimable = values.get("SReclaimable", 0)
+        used = total - free - file_pages - reclaimable
+
+        if used < 0:
+            used = values.get("AnonPages", 0) + values.get("SUnreclaim", 0)
+
+    used = max(0, min(used, total))
+    return total, used
 
 total, _ = get_mem()
 SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
@@ -130,11 +289,12 @@ penalty = 0
 
 while running and time.time() < end:
     try:
-        target_pct = int(open(state_file).read().strip())
-    except:
+        with open(state_file) as f:
+            target_pct = int(f.read().strip())
+    except (OSError, ValueError):
         target_pct = 0
 
-    target_pct = max(0, target_pct - penalty)
+    target_pct = max(0, min(100, target_pct - penalty))
 
     target = min(total * target_pct / 100.0, total - SAFE_FREE)
 
@@ -160,58 +320,64 @@ PY
 }
 
 # =============================================================================
-# CPU worker（PSI简化版）
+# CPU worker
 # =============================================================================
 run_on_cpu() {
     taskset -c "$1" bash -c '
-STATE=$1; MIN=$2
-
-psi() {
-    [[ -f /proc/pressure/cpu ]] && awk "/some/ {print \$2}" /proc/pressure/cpu | cut -d= -f2 | cut -d. -f1 || echo 0
-}
+STATE=$1
+DURATION=$2
+start=$SECONDS
 
 calibrate() {
-    local n=5000 s e
+    local n=5000 s e elapsed
     s=$(date +%s%N)
     for ((i=0;i<n;i++)); do ((x=i*i)); done
     e=$(date +%s%N)
-    echo $(( n / ((e-s)/1000000 + 1) ))
+    elapsed=$(( (e - s) / 1000000 + 1 ))
+    echo $(( n / elapsed ))
 }
 
 L=$(calibrate)
-last=$SECONDS
+next_calibrate=$(( SECONDS + 30 ))
 
-while true; do
-    p=$(psi)
-    (( p > 100 )) && p=100
+while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+    if (( SECONDS >= next_calibrate )); then
+        L=$(calibrate)
+        next_calibrate=$(( SECONDS + 30 ))
+    fi
 
     read -r v < "$STATE"
     v=${v%% *}
-    [[ "$v" =~ ^[0-9]+$ ]] || v=$MIN
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
 
-    p=$(( v + p/10 ))
-    (( p > 100 )) && p=100
+    (( v < 0 )) && v=0
+    (( v > 100 )) && v=100
 
-    burn=$(( p * L * 10 ))
-
+    burn=$(( v * L ))
     for ((i=0;i<burn;i++)); do ((x=i*i)); done
 
-    idle=$((100 - p))
-    (( idle > 0 )) && sleep "0.$idle"
-done' _ "$CPU_STATE_FILE" "$CPU_MIN" &
+    idle_ms=$((100 - v))
+    if (( idle_ms > 0 )); then
+        printf -v idle_s "0.%03d" "$idle_ms"
+        sleep "$idle_s"
+    fi
+done' _ "$CPU_STATE_FILE" "$DURATION" &
+    CHILD_PIDS+=("$!")
 }
 
 # =============================================================================
 # start
 # =============================================================================
-printf "%-3s\n" "$CPU_MIN" > "$CPU_STATE_FILE"
+printf "%-3s\n" "0" > "$CPU_STATE_FILE"
 printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
-value_controller "$CPU_MIN" "$CPU_MAX" "$CPU_WAVE_SEC" "$CPU_STATE_FILE" &
-value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_WAVE_SEC" "$MEM_STATE_FILE" &
+cpu_total_controller "$CPU_MIN" "$CPU_MAX" "$CPU_CHANGE_SEC" "$CPU_STATE_FILE" &
+CHILD_PIDS+=("$!")
+random_value_controller "$MEM_MIN" "$MEM_MAX" "$MEM_CHANGE_SEC" "$MEM_STATE_FILE" &
+CHILD_PIDS+=("$!")
 
 # =============================================================================
-# NUMA FIX (核心修复点)
+# NUMA
 # =============================================================================
 if command -v numactl >/dev/null 2>&1; then
 
@@ -227,6 +393,7 @@ if command -v numactl >/dev/null 2>&1; then
 
             numactl --preferred="$n" \
             bash -c "$(declare -f memory_worker); memory_worker '$n' '$MEM_STATE_FILE' '$DURATION'" &
+            CHILD_PIDS+=("$!")
 
         else
             echo "[WARN] skip invalid NUMA node $n"
@@ -236,10 +403,11 @@ if command -v numactl >/dev/null 2>&1; then
 
 else
     memory_worker "global" "$MEM_STATE_FILE" "$DURATION" &
+    CHILD_PIDS+=("$!")
 fi
 
 # CPU workers
-for c in $(seq 1 $(( $(nproc) - 1 ))); do
+for c in $(seq 0 $(( CPU_COUNT - 1 ))); do
     run_on_cpu "$c"
 done
 
