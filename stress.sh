@@ -10,38 +10,36 @@
 #   如果原有内存占用已经高于 mem_max，脚本只能释放自己申请的内存。
 # =============================================================================
 
-if [[ $# -lt 6 ]]; then
-    echo "Usage: $0 <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
+if [[ $# -lt 8 ]]; then
+    echo "Usage: $0 <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]"
     exit 1
 fi
 
-CPU_MIN=$1
-CPU_MAX=$2
-CPU_CHANGE_SEC=$3
-MEM_MIN=$4
-MEM_MAX=$5
-MEM_CHANGE_SEC=$6
-DURATION=${7:-infinite}
+START_DELAY_MAX=$1
+END_DELAY_MAX=$2
+CPU_MIN=$3
+CPU_MAX=$4
+CPU_CHANGE_SEC=$5
+MEM_MIN=$6
+MEM_MAX=$7
+MEM_CHANGE_SEC=$8
+DURATION=${9:-infinite}
 
 die() {
     echo "[ERROR] $*" >&2
     exit 1
 }
 
-is_uint() {
+is_non_negative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
-validate_percent() {
-    local name=$1 value=$2
-    is_uint "$value" || die "$name must be an integer between 0 and 100"
-    (( value >= 0 && value <= 100 )) || die "$name must be between 0 and 100"
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
-validate_positive_int() {
-    local name=$1 value=$2
-    is_uint "$value" || die "$name must be a positive integer"
-    (( value > 0 )) || die "$name must be greater than 0"
+is_percent() {
+    is_non_negative_integer "$1" && (( 10#$1 <= 100 ))
 }
 
 require_cmd() {
@@ -49,25 +47,41 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
 }
 
-validate_percent "cpu_min" "$CPU_MIN"
-validate_percent "cpu_max" "$CPU_MAX"
-validate_percent "mem_min" "$MEM_MIN"
-validate_percent "mem_max" "$MEM_MAX"
-(( CPU_MIN <= CPU_MAX )) || die "cpu_min must be <= cpu_max"
-(( MEM_MIN <= MEM_MAX )) || die "mem_min must be <= mem_max"
-validate_positive_int "cpu_step" "$CPU_CHANGE_SEC"
-validate_positive_int "mem_step" "$MEM_CHANGE_SEC"
+is_non_negative_integer "$START_DELAY_MAX" || die "start_delay_max must be a non-negative integer"
+is_non_negative_integer "$END_DELAY_MAX" || die "end_delay_max must be a non-negative integer"
+is_percent "$CPU_MIN" || die "cpu_min must be an integer between 0 and 100"
+is_percent "$CPU_MAX" || die "cpu_max must be an integer between 0 and 100"
+is_percent "$MEM_MIN" || die "mem_min must be an integer between 0 and 100"
+is_percent "$MEM_MAX" || die "mem_max must be an integer between 0 and 100"
+is_positive_integer "$CPU_CHANGE_SEC" || die "cpu_step must be a positive integer"
+is_positive_integer "$MEM_CHANGE_SEC" || die "mem_step must be a positive integer"
 if [[ "$DURATION" != "infinite" ]]; then
-    validate_positive_int "duration" "$DURATION"
+    is_non_negative_integer "$DURATION" || die "duration must be a non-negative integer or 'infinite'"
 fi
 
+START_DELAY_MAX=$((10#$START_DELAY_MAX))
+END_DELAY_MAX=$((10#$END_DELAY_MAX))
+CPU_MIN=$((10#$CPU_MIN))
+CPU_MAX=$((10#$CPU_MAX))
+CPU_CHANGE_SEC=$((10#$CPU_CHANGE_SEC))
+MEM_MIN=$((10#$MEM_MIN))
+MEM_MAX=$((10#$MEM_MAX))
+MEM_CHANGE_SEC=$((10#$MEM_CHANGE_SEC))
+if [[ "$DURATION" != "infinite" ]]; then
+    DURATION=$((10#$DURATION))
+fi
+
+(( CPU_MIN <= CPU_MAX )) || die "cpu_min must be <= cpu_max"
+(( MEM_MIN <= MEM_MAX )) || die "mem_min must be <= mem_max"
+
 [[ -r /proc/stat ]] || die "/proc/stat is required; this script must run on Linux with procfs"
+[[ -r /proc/self/status ]] || die "/proc/self/status is required; this script must run on Linux with procfs"
 for cmd in taskset python3 nproc date; do
     require_cmd "$cmd"
 done
 [[ "$(date +%s%N)" =~ ^[0-9]+$ ]] || die "GNU date with %N support is required"
 CPU_COUNT=$(nproc)
-is_uint "$CPU_COUNT" && (( CPU_COUNT > 0 )) || die "nproc returned an invalid CPU count: $CPU_COUNT"
+is_positive_integer "$CPU_COUNT" || die "nproc returned an invalid CPU count: $CPU_COUNT"
 
 STATE_DIR=${STRESS_STATE_DIR:-/dev/shm}
 if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
@@ -99,14 +113,14 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 # =============================================================================
-# NUMA bitmap parser
+# bitmap / range parser
 # =============================================================================
 expand_nodes() {
     local input=$1
     local out=""
-    local p start end i
+    local start end i p
+    local -a parts
 
-    # 支持：0-1, 0,1, 0-3,8-10 混合
     IFS=',' read -ra parts <<< "$input"
 
     for p in "${parts[@]}"; do
@@ -114,14 +128,27 @@ expand_nodes() {
             start=${p%-*}
             end=${p#*-}
 
-            # 防御非法输入
-            [[ -z "$start" || -z "$end" ]] && continue
+            if ! is_non_negative_integer "$start" || ! is_non_negative_integer "$end"; then
+                echo "[WARN] skip invalid range $p" >&2
+                continue
+            fi
+
+            start=$((10#$start))
+            end=$((10#$end))
+            if (( start > end )); then
+                echo "[WARN] skip invalid range $p" >&2
+                continue
+            fi
 
             for ((i=start;i<=end;i++)); do
                 out="$out $i"
             done
         else
-            out="$out $p"
+            if is_non_negative_integer "$p"; then
+                out="$out $((10#$p))"
+            else
+                echo "[WARN] skip invalid value $p" >&2
+            fi
         fi
     done
 
@@ -164,12 +191,18 @@ sleep_with_deadline() {
     done
 }
 
+random_delay() {
+    local delay_max=$1
+    (( delay_max > 0 )) && echo $(( RANDOM % (delay_max + 1) )) || echo 0
+}
+
 # =============================================================================
 # random target controller
 # =============================================================================
 random_value_controller() {
     local min=$1 max=$2 step=$3 file=$4
     local start=$SECONDS
+    local val
 
     while within_duration "$start"; do
         val=$min
@@ -246,7 +279,7 @@ cpu_total_controller() {
         load=${load%% *}
         [[ "$load" =~ ^[0-9]+$ ]] || load=0
 
-        # 比例控制：死区 +/-2%，限幅 +/-15，避免大误差时一次性跳变导致振荡。
+        # Proportional controller with +/-2% deadband and +/-15 step cap.
         error=$(( target - actual ))
         if (( error > 2 )); then
             adjust=$(( error / 3 ))
@@ -272,10 +305,17 @@ cpu_total_controller() {
 # memory worker
 # =============================================================================
 memory_worker() {
-exec python3 - "$1" "$2" "$3" <<'PY'
-import time, sys, signal
+    local node_id=$1 state_file=$2 duration=$3 end_delay_max=$4 preferred_node=${5:-}
+    local cmd=(python3 - "$node_id" "$state_file" "$duration" "$end_delay_max")
 
-node_id, state_file, duration = sys.argv[1:]
+    if [[ -n "$preferred_node" ]]; then
+        cmd=(numactl --preferred="$preferred_node" "${cmd[@]}")
+    fi
+
+    exec "${cmd[@]}" <<'PY'
+import random, time, sys, signal
+
+node_id, state_file, duration, end_delay_max = sys.argv[1:]
 
 running = True
 def stop(*_):
@@ -286,6 +326,7 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 
 file_path = "/proc/meminfo" if node_id == "global" else f"/sys/devices/system/node/node{node_id}/meminfo"
+GLOBAL_MEMINFO = "/proc/meminfo"
 
 def parse(line):
     for x in reversed(line.split()):
@@ -293,73 +334,173 @@ def parse(line):
             return int(x)
     return 0
 
-def meminfo_key(line):
-    return line.split(":", 1)[0].split()[-1].strip()
+def key_of(line):
+    if ":" not in line:
+        return ""
+    parts = line.split(":", 1)[0].split()
+    return parts[-1] if parts else ""
+
+def read_fields(path):
+    fields = {}
+    with open(path) as f:
+        for line in f:
+            key = key_of(line)
+            if key:
+                fields[key] = parse(line)
+    return fields
+
+def reclaimable(fields):
+    return fields.get("KReclaimable", fields.get("SReclaimable", 0))
+
+def file_cache(fields):
+    return max(0, fields.get("FilePages", 0) - fields.get("Shmem", 0))
+
+def estimate_available(fields):
+    if node_id == "global":
+        return fields.get(
+            "MemAvailable",
+            fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
+        )
+
+    return fields.get("MemFree", 0) + file_cache(fields) + reclaimable(fields)
 
 def get_mem():
-    values = {}
-
-    with open(file_path) as f:
-        for line in f:
-            if ":" in line:
-                values[meminfo_key(line)] = parse(line)
-
-    total = values.get("MemTotal", 0)
-    if total <= 0:
-        return 0, 0
-
-    if "MemAvailable" in values:
-        used = total - values["MemAvailable"]
-    else:
-        free = values.get("MemFree", 0)
-        file_pages = values.get("FilePages", values.get("Cached", 0))
-        reclaimable = values.get("SReclaimable", 0)
-        used = total - free - file_pages - reclaimable
-
-        if used < 0:
-            used = values.get("AnonPages", 0) + values.get("SUnreclaim", 0)
-
-    used = max(0, min(used, total))
+    fields = read_fields(file_path)
+    total = fields.get("MemTotal", 0)
+    available = estimate_available(fields)
+    used = max(0, total - min(available, total))
     return total, used
 
-total, _ = get_mem()
-SAFE_FREE = max(int(total * 0.03), 1024 * 1024)
+def global_available():
+    try:
+        fields = read_fields(GLOBAL_MEMINFO)
+    except OSError:
+        return 0
+    available = fields.get(
+        "MemAvailable",
+        fields.get("MemFree", 0) + fields.get("Cached", 0) + reclaimable(fields),
+    )
+    return max(0, available)
+
+def duration_end(value):
+    if value == "infinite":
+        return float("inf")
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise SystemExit(f"invalid duration: {value}")
+    if seconds < 0:
+        raise SystemExit(f"invalid duration: {value}")
+    return time.time() + seconds
+
+def parse_delay_max(value):
+    try:
+        delay_max = int(value)
+    except ValueError:
+        return 0
+    return max(0, delay_max)
+
+def random_delay(delay_max):
+    if delay_max <= 0:
+        return 0
+    return random.randint(0, delay_max)
+
+def sleep_until_release(delay):
+    if delay <= 0:
+        return
+    print(f"[END_DELAY] node={node_id} sleep {delay}s before release", flush=True)
+    deadline = time.time() + delay
+    while running:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
+
+start_fields = read_fields(file_path)
+total = start_fields.get("MemTotal", 0)
+start_available = estimate_available(start_fields)
+start_filepages = start_fields.get("FilePages", 0)
+start_shmem = start_fields.get("Shmem", 0)
+start_reclaimable = reclaimable(start_fields)
+start_file_cache = file_cache(start_fields)
+shmem_present = 1 if "Shmem" in start_fields else 0
+SAFE_FREE_MIN_KB = 1024 * 1024
+ALLOC_CHUNK_BYTES = 50 * 1024 * 1024
+RELEASE_MARGIN_KB = 50 * 1024
+SAFE_FREE = max(int(total * 0.03), SAFE_FREE_MIN_KB)
+PENALTY_STEP = 5
+print(
+    f"[MEM_START] node={node_id} total_kb={total} available_kb={start_available} "
+    f"safe_free_kb={SAFE_FREE} filepages_kb={start_filepages} shmem_kb={start_shmem} "
+    f"shmem_present={shmem_present} file_cache_kb={start_file_cache} "
+    f"reclaimable_kb={start_reclaimable}",
+    flush=True,
+)
 
 pool = []
-start = time.time()
-end = float("inf") if duration == "infinite" else start + int(duration)
+end = duration_end(duration)
 
 penalty = 0
+global_guard_logged = False
 
 while running and time.time() < end:
     try:
         with open(state_file) as f:
-            target_pct = int(f.read().strip())
+            requested_pct = int(f.read().strip())
     except (OSError, ValueError):
-        target_pct = 0
+        requested_pct = 0
 
-    target_pct = max(0, min(100, target_pct - penalty))
-
-    target = max(0, min(total * target_pct / 100.0, total - SAFE_FREE))
+    effective_pct = max(0, min(100, requested_pct - penalty))
+    target = max(0, min(total * effective_pct / 100.0, total - SAFE_FREE))
 
     used = get_mem()[1]
+    allocated = False
+    guard_blocked = False
 
     if used < target:
-        try:
-            pool.append(bytearray(50 * 1024 * 1024))
-            penalty = max(0, penalty - 1)
-        except MemoryError:
-            penalty += 5
-            time.sleep(5)
+        available_global = global_available()
+        if available_global < SAFE_FREE_MIN_KB:
+            guard_blocked = True
+            penalty += PENALTY_STEP
+            if not global_guard_logged:
+                print(
+                    f"[MEM_GUARD] node={node_id} global_available_kb={available_global} "
+                    f"below_safe_free_kb={SAFE_FREE_MIN_KB}; pause allocation",
+                    flush=True,
+                )
+                global_guard_logged = True
+            time.sleep(1)
+        else:
+            try:
+                pool.append(bytearray(ALLOC_CHUNK_BYTES))
+                allocated = True
+            except MemoryError:
+                penalty += PENALTY_STEP
+                time.sleep(5)
 
-    elif used > target + 50 * 1024 and pool:
+    elif used > target + RELEASE_MARGIN_KB and pool:
         pool.pop()
 
+    if not guard_blocked:
+        global_guard_logged = False
+
+    if allocated:
+        penalty = max(0, penalty - PENALTY_STEP)
+    elif penalty > 0:
+        penalty = max(0, penalty - 1)
+
     time.sleep(0.3)
+
+if running:
+    delay_max = parse_delay_max(end_delay_max)
+    if delay_max > 0:
+        sleep_until_release(random_delay(delay_max))
 
 while pool:
     pool.pop()
     time.sleep(0.01)
+
+print(f"[MEM_EXIT] node={node_id}", flush=True)
 PY
 }
 
@@ -370,6 +511,8 @@ run_on_cpu() {
     taskset -c "$1" bash -c '
 STATE=$1
 DURATION=$2
+END_DELAY_MAX=$3
+CPU_ID=$4
 start=$SECONDS
 
 calibrate() {
@@ -402,16 +545,30 @@ while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
 
     idle_ms=$((100 - v))
     if (( idle_ms > 0 )); then
-        printf -v idle_s "0.%03d" "$idle_ms"
-        sleep "$idle_s"
+        printf -v idle_sec "0.%03d" "$idle_ms"
+        sleep "$idle_sec"
     fi
-done' _ "$CPU_STATE_FILE" "$DURATION" &
+done
+
+if [[ "$DURATION" != "infinite" ]] && (( END_DELAY_MAX > 0 )); then
+    END_DELAY=$(( RANDOM % (END_DELAY_MAX + 1) ))
+    if (( END_DELAY > 0 )); then
+        echo "[END_DELAY] cpu=$CPU_ID sleep ${END_DELAY}s before exit"
+        sleep "$END_DELAY"
+    fi
+fi' _ "$CPU_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$1" &
     CHILD_PIDS+=("$!")
 }
 
 # =============================================================================
 # start
 # =============================================================================
+if (( START_DELAY_MAX > 0 )); then
+    START_DELAY=$(random_delay "$START_DELAY_MAX")
+    echo "[START_DELAY] sleep ${START_DELAY}s (range: 0-${START_DELAY_MAX}s)"
+    sleep "$START_DELAY"
+fi
+
 printf "%-3s\n" "0" > "$CPU_STATE_FILE"
 printf "%-3s\n" "$MEM_MIN" > "$MEM_STATE_FILE"
 
@@ -434,15 +591,10 @@ if command -v numactl >/dev/null 2>&1; then
 
     for n in $(expand_nodes "$NODE_RAW"); do
 
-        # 防御非法 node
         if [[ -d /sys/devices/system/node/node$n ]]; then
-
             echo "[NUMA] node=$n"
-
-            numactl --preferred="$n" \
-            bash -c "$(declare -f memory_worker); memory_worker '$n' '$MEM_STATE_FILE' '$DURATION'" &
+            memory_worker "$n" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" "$n" &
             CHILD_PIDS+=("$!")
-
         else
             echo "[WARN] skip invalid NUMA node $n"
         fi
@@ -450,7 +602,7 @@ if command -v numactl >/dev/null 2>&1; then
     done
 
 else
-    memory_worker "global" "$MEM_STATE_FILE" "$DURATION" &
+    memory_worker "global" "$MEM_STATE_FILE" "$DURATION" "$END_DELAY_MAX" &
     CHILD_PIDS+=("$!")
 fi
 
