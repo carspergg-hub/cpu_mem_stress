@@ -62,7 +62,7 @@ if [[ "$DURATION" != "infinite" ]]; then
 fi
 
 [[ -r /proc/stat ]] || die "/proc/stat is required; this script must run on Linux with procfs"
-for cmd in taskset python3 nproc date seq; do
+for cmd in taskset python3 nproc date; do
     require_cmd "$cmd"
 done
 [[ "$(date +%s%N)" =~ ^[0-9]+$ ]] || die "GNU date with %N support is required"
@@ -104,6 +104,7 @@ trap cleanup SIGINT SIGTERM EXIT
 expand_nodes() {
     local input=$1
     local out=""
+    local p start end i
 
     # 支持：0-1, 0,1, 0-3,8-10 混合
     IFS=',' read -ra parts <<< "$input"
@@ -127,6 +128,41 @@ expand_nodes() {
     echo "$out"
 }
 
+get_allowed_cpus() {
+    local key value raw=""
+
+    while read -r key value; do
+        if [[ "$key" == "Cpus_allowed_list:" ]]; then
+            raw=$value
+            break
+        fi
+    done < /proc/self/status
+
+    [[ -n "$raw" ]] || raw="0-$(( CPU_COUNT - 1 ))"
+    expand_nodes "$raw"
+}
+
+within_duration() {
+    local start=$1
+    [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION ))
+}
+
+sleep_with_deadline() {
+    local seconds=$1 start=$2
+    local end=$(( SECONDS + seconds ))
+    local deadline remain
+
+    if [[ "$DURATION" != "infinite" ]]; then
+        deadline=$(( start + DURATION ))
+        (( end > deadline )) && end=$deadline
+    fi
+
+    while (( SECONDS < end )); do
+        remain=$(( end - SECONDS ))
+        (( remain > 1 )) && sleep 1 || sleep "$remain"
+    done
+}
+
 # =============================================================================
 # random target controller
 # =============================================================================
@@ -134,11 +170,11 @@ random_value_controller() {
     local min=$1 max=$2 step=$3 file=$4
     local start=$SECONDS
 
-    while [[ "$DURATION" == "infinite" ]] || (( SECONDS < start + DURATION )); do
+    while within_duration "$start"; do
         val=$min
         (( max > min )) && val=$(( RANDOM % (max - min + 1) + min ))
         echo "$val" > "$file"
-        sleep "$step"
+        sleep_with_deadline "$step" "$start"
     done
 }
 
@@ -194,24 +230,22 @@ cpu_total_controller() {
             next_change=$(( SECONDS + change_sec ))
         fi
 
-        actual=$(cpu_total_usage 1)
+        actual=$(cpu_total_usage 0.5)
 
         read -r load < "$file"
         load=${load%% *}
         [[ "$load" =~ ^[0-9]+$ ]] || load=0
 
-        if (( actual < min )); then
-            error=$(( target - actual ))
-            (( error < 1 )) && error=1
-            adjust=$error
-        elif (( actual > max )); then
-            error=$(( actual - target ))
-            (( error < 1 )) && error=1
-            adjust=$(( -error ))
-        elif (( actual < target - 2 )); then
-            adjust=1
-        elif (( actual > target + 2 )); then
-            adjust=-1
+        # 比例控制：死区 +/-2%，限幅 +/-15，避免大误差时一次性跳变导致振荡。
+        error=$(( target - actual ))
+        if (( error > 2 )); then
+            adjust=$(( error / 3 ))
+            (( adjust < 1 )) && adjust=1
+            (( adjust > 15 )) && adjust=15
+        elif (( error < -2 )); then
+            adjust=$(( error / 3 ))
+            (( adjust > -1 )) && adjust=-1
+            (( adjust < -15 )) && adjust=-15
         else
             adjust=0
         fi
@@ -250,7 +284,7 @@ def parse(line):
     return 0
 
 def meminfo_key(line):
-    return line.split(":", 1)[0].split(",")[-1].strip()
+    return line.split(":", 1)[0].split()[-1].strip()
 
 def get_mem():
     values = {}
@@ -296,7 +330,7 @@ while running and time.time() < end:
 
     target_pct = max(0, min(100, target_pct - penalty))
 
-    target = min(total * target_pct / 100.0, total - SAFE_FREE)
+    target = max(0, min(total * target_pct / 100.0, total - SAFE_FREE))
 
     used = get_mem()[1]
 
@@ -407,7 +441,9 @@ else
 fi
 
 # CPU workers
-for c in $(seq 0 $(( CPU_COUNT - 1 ))); do
+CPU_LIST=$(get_allowed_cpus)
+[[ -n "$CPU_LIST" ]] || die "no allowed CPUs found"
+for c in $CPU_LIST; do
     run_on_cpu "$c"
 done
 
