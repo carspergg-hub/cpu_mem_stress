@@ -1,103 +1,103 @@
-# CPU & Memory Stress Tool
+# CPU & Memory 压力测试工具
 
-`stress.sh` is a Linux CPU and memory stress script designed for cloud, cgroup, and NUMA environments. It can keep CPU and memory usage near configured target ranges, while supporting randomized start and end delays for staggered test runs.
+`stress.sh` 是一个面向 Linux、云主机、容器、cgroup 和 NUMA 环境的 CPU/内存压力测试脚本。它可以按指定区间动态调节 CPU 和内存压力，并支持随机启动延迟、随机结束释放延迟，适合批量压测时错峰启动和错峰退出。
 
-## Features
+## 功能特性
 
-- CPU and memory targets are controlled independently.
-- CPU target is measured against the current process allowed CPU set from `Cpus_allowed_list`.
-- On unrestricted bare metal, the CPU target is equivalent to total host CPU usage.
-- In containers or cpuset-limited environments, only allowed CPUs are measured and stressed.
-- Memory workers are NUMA-aware when `numactl` is available.
-- Memory allocation uses safety guards to reduce reclaim and swap storms.
-- Finite `duration` exits cleanly and releases allocated memory.
-- Optional randomized `start_delay_max` and `end_delay_max` help stagger multiple stress processes.
+- CPU 和内存目标独立控制。
+- CPU 目标按当前进程允许的 CPU 集合统计，即 `/proc/self/status` 中的 `Cpus_allowed_list`。
+- 在裸机且未限制 cpuset 时，CPU 目标等价于整机总 CPU 使用率。
+- 在容器或 cpuset 限制环境中，只统计并加压允许 CPU 集合内的 CPU。
+- 检测到 `numactl` 时，内存 worker 支持 NUMA preferred 分配。
+- 内存分配带安全保护，尽量降低 reclaim、swap storm 和 kswapd 风暴风险。
+- 设置有限 `duration` 时，脚本会自动退出并释放自身申请的内存。
+- 支持 `start_delay_max` 和 `end_delay_max`，用于多实例压测时随机错峰。
 
-## Requirements
+## 运行依赖
 
-- Linux with `/proc/stat` and `/proc/self/status`
+- Linux，且可读取 `/proc/stat` 和 `/proc/self/status`
 - `bash`
 - `python3`
 - `taskset`
 - `nproc`
-- GNU `date` with `%N` support
-- `numactl` is optional, used for NUMA preferred placement when available
+- 支持 `%N` 的 GNU `date`
+- `numactl` 可选；存在时用于 NUMA preferred 分配
 
-## Download
+## 下载
 
 ```bash
 wget https://raw.githubusercontent.com/carspergg-hub/cpu_mem_stress/refs/heads/main/stress.sh
 chmod +x stress.sh
 ```
 
-## Usage
+## 使用方式
 
 ```bash
 ./stress.sh <start_delay_max> <end_delay_max> <cpu_min> <cpu_max> <cpu_step> <mem_min> <mem_max> <mem_step> [duration]
 ```
 
-## Parameters
+## 参数说明
 
-| Parameter | Description |
+| 参数 | 说明 |
 | --- | --- |
-| `start_delay_max` | Random startup delay upper bound in seconds. The script sleeps `0..start_delay_max` seconds before starting stress workers. |
-| `end_delay_max` | Random exit/release delay upper bound in seconds after finite `duration` ends. |
-| `cpu_min` | Lower CPU usage target percentage for the allowed CPU set. |
-| `cpu_max` | Upper CPU usage target percentage for the allowed CPU set. |
-| `cpu_step` | Seconds between random CPU target changes within `[cpu_min, cpu_max]`. |
-| `mem_min` | Lower estimated memory usage target percentage. |
-| `mem_max` | Upper estimated memory usage target percentage. |
-| `mem_step` | Seconds between random memory target changes within `[mem_min, mem_max]`. |
-| `duration` | Optional run duration in seconds. Use `infinite` or omit it to run until stopped. |
+| `start_delay_max` | 启动前随机等待的最大秒数。实际等待时间为 `0..start_delay_max` 秒。 |
+| `end_delay_max` | 有限 `duration` 结束后，worker 释放/退出前随机等待的最大秒数。 |
+| `cpu_min` | CPU 使用率目标下限，百分比，作用于当前进程允许 CPU 集合。 |
+| `cpu_max` | CPU 使用率目标上限，百分比，作用于当前进程允许 CPU 集合。 |
+| `cpu_step` | CPU 目标值随机变化间隔，单位秒。 |
+| `mem_min` | 估算内存使用率目标下限，百分比。 |
+| `mem_max` | 估算内存使用率目标上限，百分比。 |
+| `mem_step` | 内存目标值随机变化间隔，单位秒。 |
+| `duration` | 可选，运行时长，单位秒。省略或使用 `infinite` 表示一直运行，直到手动停止。 |
 
-`cpu_step` and `mem_step` are random target change intervals. They are not sine-wave or smooth ramp intervals.
+注意：`cpu_step` 和 `mem_step` 表示“随机目标值变化间隔”，不是正弦波、锯齿波或平滑曲线周期。
 
-## Examples
+## 使用示例
 
-Run for 2 hours, no start or end delay, keep CPU around 30-40%, keep memory around 55-75%, change CPU target every 300 seconds and memory target every 600 seconds:
+运行 2 小时，不设置启动/结束延迟，CPU 控制在 30%-40%，内存控制在 55%-75%；CPU 目标每 300 秒随机变化一次，内存目标每 600 秒随机变化一次：
 
 ```bash
 ./stress.sh 0 0 30 40 300 55 75 600 7200
 ```
 
-Allow startup delay up to 60 seconds and exit delay up to 120 seconds:
+启动前最多随机等待 60 秒，结束时最多随机等待 120 秒：
 
 ```bash
 ./stress.sh 60 120 30 70 30 50 80 60 3600
 ```
 
-Run until manually stopped:
+一直运行直到手动停止：
 
 ```bash
 ./stress.sh 0 0 20 60 10 40 70 30
 ```
 
-## CPU Target Semantics
+## CPU 目标语义
 
-The CPU controller samples `/proc/stat` for the CPUs listed in `/proc/self/status` under `Cpus_allowed_list`. It adjusts worker load so the measured usage for that allowed CPU set stays near the selected target.
+脚本会读取 `/proc/self/status` 中的 `Cpus_allowed_list`，并只对这些允许 CPU 统计 `/proc/stat`。CPU 控制器会动态调节 worker 压力，使允许 CPU 集合的总使用率尽量接近当前随机选中的目标值。
 
-If other processes are already using more CPU than `cpu_max`, the script can only reduce its own generated CPU pressure to zero. It cannot reduce CPU consumed by other processes.
+如果系统或容器里已有其它进程让 CPU 使用率超过 `cpu_max`，脚本只能把自身产生的 CPU 压力降到 0，不能降低其它进程消耗的 CPU。
 
-## Memory Target Semantics
+## 内存目标语义
 
-Memory workers estimate used memory as:
+内存 worker 会估算当前已用内存：
 
-- Global mode: based on `MemAvailable` when available.
-- NUMA mode: based on node `MemFree`, file cache, and reclaimable memory fields.
+- 全局模式：优先基于 `MemAvailable` 估算。
+- NUMA 模式：基于节点 `MemFree`、文件缓存和可回收内存字段估算。
 
-If existing memory usage is already above `mem_max`, the script can only release memory allocated by itself. It cannot reclaim memory owned by other processes.
+如果已有内存使用率高于 `mem_max`，脚本只能释放自己申请的内存，不能回收其它进程占用的内存。
 
-The script keeps a safety reserve and pauses allocation when global available memory falls below the guard threshold.
+脚本会保留安全水位。当全局可用内存低于保护阈值时，会暂停继续分配，降低触发系统回收和 swap 风暴的风险。
 
-## NUMA Behavior
+## NUMA 行为
 
-When `numactl` is available, the script reads:
+检测到 `numactl` 时，脚本会读取：
 
 ```bash
 /sys/devices/system/node/online
 ```
 
-It supports mixed node list formats such as:
+支持以下 NUMA 节点格式：
 
 ```text
 0-1
@@ -105,15 +105,21 @@ It supports mixed node list formats such as:
 0-3,8-10
 ```
 
-Each valid node gets a memory worker using `numactl --preferred=<node>`.
+每个有效 NUMA 节点都会启动一个内存 worker，并使用：
 
-## Stop
+```bash
+numactl --preferred=<node>
+```
+
+## 停止方式
+
+前台运行时：
 
 ```bash
 Ctrl+C
 ```
 
-Or from another shell:
+或在另一个 shell 中执行：
 
 ```bash
 pkill -f stress.sh
