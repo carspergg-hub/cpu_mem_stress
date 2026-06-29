@@ -1,13 +1,13 @@
 # CPU & Memory 压力测试工具
 
-`stress.sh` 是一个面向 Linux、云主机、容器、cgroup 和 NUMA 环境的 CPU/内存压力测试脚本。它可以按指定区间动态调节 CPU 和内存压力，并支持随机启动延迟、随机结束释放延迟，适合批量压测时错峰启动和错峰退出。
+`stress.sh` 是一个面向 Linux 裸机、普通云主机和 NUMA 环境的 CPU/内存压力测试脚本。它可以按指定区间动态调节 CPU 和内存压力，并支持随机启动延迟、随机结束释放延迟，适合批量压测时错峰启动和错峰退出。
 
 ## 功能特性
 
 - CPU 和内存目标独立控制。
 - CPU 目标按当前进程允许的 CPU 集合统计，即 `/proc/self/status` 中的 `Cpus_allowed_list`。
-- 在裸机且未限制 cpuset 时，CPU 目标等价于整机总 CPU 使用率。
-- 在容器或 cpuset 限制环境中，只统计并加压允许 CPU 集合内的 CPU。
+- 在未限制 CPU 集合时，CPU 目标等价于整机总 CPU 使用率。
+- 如果进程被限制到部分 CPU，只统计并加压允许 CPU 集合内的 CPU。
 - 检测到 `numactl` 时，内存 worker 支持 NUMA preferred 分配。
 - 内存分配带安全保护，尽量降低 reclaim、swap storm 和 kswapd 风暴风险。
 - 设置有限 `duration` 时，脚本会自动退出并释放自身申请的内存。
@@ -76,7 +76,7 @@ chmod +x stress.sh
 
 脚本会读取 `/proc/self/status` 中的 `Cpus_allowed_list`，并只对这些允许 CPU 统计 `/proc/stat`。CPU 控制器会动态调节 worker 压力，使允许 CPU 集合的总使用率尽量接近当前随机选中的目标值。
 
-如果系统或容器里已有其它进程让 CPU 使用率超过 `cpu_max`，脚本只能把自身产生的 CPU 压力降到 0，不能降低其它进程消耗的 CPU。
+如果系统里已有其它进程让 CPU 使用率超过 `cpu_max`，脚本只能把自身产生的 CPU 压力降到 0，不能降低其它进程消耗的 CPU。
 
 ## 内存目标语义
 
