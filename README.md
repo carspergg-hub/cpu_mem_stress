@@ -5,9 +5,9 @@
 ## 功能特性
 
 - CPU 和内存目标独立控制。
-- CPU 目标按当前进程允许的 CPU 集合统计，即 `/proc/self/status` 中的 `Cpus_allowed_list`。
-- 在未限制 CPU 集合时，CPU 目标等价于整机总 CPU 使用率。
-- 如果进程被限制到部分 CPU，只统计并加压允许 CPU 集合内的 CPU。
+- CPU 目标按整机总 CPU 使用率统计，基于 `/proc/stat` 的总 CPU 行。
+- 在 Linux 裸机或普通云主机中，CPU 目标表示加压后的系统总 CPU 使用率。
+- 如果脚本进程被 `taskset` 等方式限制到部分 CPU，worker 只能在允许 CPU 上加压，可能无法把整机总 CPU 推到目标值。
 - 检测到 `numactl` 时，内存 worker 支持 NUMA preferred 分配。
 - 内存分配带安全保护，尽量降低 reclaim、swap storm 和 kswapd 风暴风险。
 - 设置有限 `duration` 时，脚本会自动退出并释放自身申请的内存。
@@ -42,8 +42,8 @@ chmod +x stress.sh
 | --- | --- |
 | `start_delay_max` | 启动前随机等待的最大秒数。实际等待时间为 `0..start_delay_max` 秒。 |
 | `end_delay_max` | 有限 `duration` 结束后，worker 释放/退出前随机等待的最大秒数。 |
-| `cpu_min` | CPU 使用率目标下限，百分比，作用于当前进程允许 CPU 集合。 |
-| `cpu_max` | CPU 使用率目标上限，百分比，作用于当前进程允许 CPU 集合。 |
+| `cpu_min` | CPU 使用率目标下限，百分比，表示加压后的系统总 CPU 使用率。 |
+| `cpu_max` | CPU 使用率目标上限，百分比，表示加压后的系统总 CPU 使用率。 |
 | `cpu_step` | CPU 目标值随机变化间隔，单位秒。 |
 | `mem_min` | 估算内存使用率目标下限，百分比。 |
 | `mem_max` | 估算内存使用率目标上限，百分比。 |
@@ -74,7 +74,9 @@ chmod +x stress.sh
 
 ## CPU 目标语义
 
-脚本会读取 `/proc/self/status` 中的 `Cpus_allowed_list`，并只对这些允许 CPU 统计 `/proc/stat`。CPU 控制器会动态调节 worker 压力，使允许 CPU 集合的总使用率尽量接近当前随机选中的目标值。
+脚本会读取 `/proc/stat` 的整机总 CPU 统计。CPU 控制器会动态调节 worker 压力，使系统总 CPU 使用率尽量接近当前随机选中的目标值。
+
+脚本仍会读取 `/proc/self/status` 中的 `Cpus_allowed_list` 来决定 worker 可以绑定到哪些 CPU。如果脚本进程本身被限制到部分 CPU，统计口径仍是整机总 CPU，但脚本只能在允许 CPU 上加压，因此高目标值可能达不到。
 
 如果系统里已有其它进程让 CPU 使用率超过 `cpu_max`，脚本只能把自身产生的 CPU 压力降到 0，不能降低其它进程消耗的 CPU。
 
